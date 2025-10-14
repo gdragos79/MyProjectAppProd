@@ -1,8 +1,15 @@
 # backend.Dockerfile.prod
 FROM node:20-alpine
 WORKDIR /app
+
+# Copy manifest files first (copies package.json and package-lock.json)
 COPY backend/package*.json ./
-RUN npm ci --only=production
-COPY backend ./
+
+# Install prod deps using lockfile
+RUN npm ci --omit=dev
+
+# Copy the rest of the app
+COPY backend/ ./
+
 EXPOSE 3000
 CMD ["node","index.js"]
