@@ -42,7 +42,7 @@ jobs:
       - name: Build+Push backend
         uses: docker/build-push-action@v6
         with:
-          context: ./backend
+          context: .
           file: ./backend.Dockerfile.prod
           push: true
           tags: |
