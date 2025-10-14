@@ -1,0 +1,61 @@
+# NOTE: the `version:` key is obsolete in modern Compose. Omit it.
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: backend
+    working_dir: /usr/src/app
+    networks:
+      - app-net
+    volumes:
+      - ./backend:/usr/src/app
+      - /usr/src/app/node_modules
+    env_file:
+      - ./backend/.env
+    tty: true
+    ports:
+      - "3000:3000"
+    # no depends_on here (avoids the cycle)
+    # healthcheck so nginx can wait for the API
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').request({host:'127.0.0.1',port:3000,path:'/api/health',method:'GET'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1)).end()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    command: ["npm","start"]
+
+  frontend:
+    build:
+      context: ./react
+    container_name: frontend
+    working_dir: /usr/src/app
+    networks:
+      - app-net
+    volumes:
+      - ./react:/usr/src/app
+      - /usr/src/app/node_modules
+    tty: true
+    expose:
+      - "5173"
+    command: ["npm","run","dev","--","--host"]
+
+  nginx:
+    build:
+      context: ./nginx
+    container_name: nginx
+    restart: always
+    tty: true
+    ports:
+      - "8000:80"
+    networks:
+      - app-net
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+
+networks:
+  app-net:
+    driver: bridge
