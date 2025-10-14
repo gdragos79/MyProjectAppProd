@@ -32,7 +32,7 @@ jobs:
       - name: Build+Push frontend
         uses: docker/build-push-action@v6
         with:
-          context: ./react
+          context: .
           file: ./frontend.Dockerfile.prod
           push: true
           tags: |
