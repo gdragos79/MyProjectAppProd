@@ -22,7 +22,7 @@ on:
 
 permissions:
   contents: read
-  packages: read   # allows GHCR pull with GITHUB_TOKEN
+  packages: read   # needed for GHCR pull with GITHUB_TOKEN
 
 env:
   COMPOSE_FILE: deploy/docker-compose.yml
@@ -33,7 +33,10 @@ jobs:
   deploy_blue:
     if: ${{ inputs.color == 'blue' }}
     runs-on: [self-hosted, app-blue]    # labels on your BLUE VM runner
-    environment: Development            # reads DB_* secrets from this environment
+    environment: Development            # DB_* secrets live here
+    concurrency:
+      group: deploy-blue
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +75,9 @@ jobs:
     if: ${{ inputs.color == 'green' }}
     runs-on: [self-hosted, app-green]   # labels on your GREEN VM runner
     environment: Development
+    concurrency:
+      group: deploy-green
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 
@@ -106,16 +112,29 @@ jobs:
           sleep 3
           curl -fsS "$HEALTH_URL" || (docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200; exit 1)
 
-  switch_proxy:
-    if: ${{ inputs.switch_traffic == 'true' }}
-    needs: [deploy_blue, deploy_green]
-    runs-on: [self-hosted, proxy]       # labels on your Proxy VM runner
+  # Split switch jobs so they're not skipped when the other color's deploy job is skipped
+  switch_proxy_to_blue:
+    if: ${{ inputs.switch_traffic == 'true' && inputs.color == 'blue' }}
+    needs: [deploy_blue]
+    runs-on: [self-hosted, proxy]
     steps:
-      - name: Switch upstream & reload Nginx
+      - name: Switch to BLUE
         run: |
           set -e
-          COLOR="${{ inputs.color }}"
-          sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf
+          sudo ln -sfn /etc/nginx/upstreams/blue.conf /etc/nginx/upstreams/active.conf
           sudo nginx -t
           sudo systemctl reload nginx
-          curl -fsS http://localhost/api/health || (echo "Proxy smoke test failed" >&2; exit 1)
+          curl -fsS http://localhost/api/health
+
+  switch_proxy_to_green:
+    if: ${{ inputs.switch_traffic == 'true' && inputs.color == 'green' }}
+    needs: [deploy_green]
+    runs-on: [self-hosted, proxy]
+    steps:
+      - name: Switch to GREEN
+        run: |
+          set -e
+          sudo ln -sfn /etc/nginx/upstreams/green.conf /etc/nginx/upstreams/active.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+          curl -fsS http://localhost/api/health
