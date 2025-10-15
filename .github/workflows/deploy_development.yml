@@ -52,33 +52,77 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- HARD CHECK: Tailscale OAuth client secrets must be present and well-formed
-      - name: Validate Tailscale OAuth secrets
+      # ========== 1) Validate secrets we’ll try to use ==========
+      - name: Validate Tailscale secrets (informational)
+        id: validate_ts
         shell: bash
         env:
           TS_ID:     ${{ secrets.TS_OAUTH_CLIENT_ID }}
           TS_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          TS_AUTH:   ${{ secrets.TS_AUTHKEY }}
         run: |
-          if [ -z "$TS_ID" ]; then
-            echo "Missing TS_OAUTH_CLIENT_ID in Environment: Development" >&2; exit 1
-          fi
-          if [ -z "$TS_SECRET" ]; then
-            echo "Missing TS_OAUTH_CLIENT_SECRET in Environment: Development" >&2; exit 1
-          fi
-          case "$TS_ID" in tskey-client-*) : ;; *) echo "TS_OAUTH_CLIENT_ID should start with 'tskey-client-'" >&2; exit 1 ;; esac
-          case "$TS_SECRET" in tskey-secret-*) : ;; *) echo "TS_OAUTH_CLIENT_SECRET should start with 'tskey-secret-'" >&2; exit 1 ;; esac
-          echo "✅ Tailscale OAuth secrets look valid."
+          set -e
+          HAS_OAUTH=false
+          HAS_AUTH=false
 
-      # ---- Connect the GitHub runner to your tailnet via OAuth client (no manual approval needed)
-      - name: Connect to Tailscale
+          if [[ -n "$TS_ID" && -n "$TS_SECRET" ]]; then
+            case "$TS_ID" in tskey-client-*) : ;; *) echo "⚠️ TS_OAUTH_CLIENT_ID not 'tskey-client-*'"; exit 0;; esac
+            case "$TS_SECRET" in tskey-secret-*) : ;; *) echo "⚠️ TS_OAUTH_CLIENT_SECRET not 'tskey-secret-*'"; exit 0;; esac
+            HAS_OAUTH=true
+          fi
+
+          if [[ -n "$TS_AUTH" ]]; then
+            case "$TS_AUTH" in tskey-auth-*) HAS_AUTH=true ;; *) echo "⚠️ TS_AUTHKEY not 'tskey-auth-*' (fallback may fail)";; esac
+          fi
+
+          echo "has_oauth=$HAS_OAUTH"   >> $GITHUB_OUTPUT
+          echo "has_authkey=$HAS_AUTH"  >> $GITHUB_OUTPUT
+          echo "✅ Validation: OAuth=$HAS_OAUTH, AuthKey=$HAS_AUTH"
+
+      # ========== 2) Connect to Tailscale via OAuth (primary) ==========
+      - name: Connect to Tailscale (OAuth)
+        id: ts_oauth
+        if: ${{ steps.validate_ts.outputs.has_oauth == 'true' }}
+        continue-on-error: true
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret:     ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          # No tags to avoid ACL issues; add if you’ve allowed them in ACLs
           args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
 
-      # ==================== BLUE path: ensure target dir + preflight ====================
-      - name: Preflight (BLUE) — ensure dir and check Docker
+      # ========== 3) Connect to Tailscale via Authkey (fallback) ==========
+      - name: Connect to Tailscale (AuthKey Fallback)
+        id: ts_auth
+        if: ${{ steps.ts_oauth.outcome != 'success' && steps.validate_ts.outputs.has_authkey == 'true' }}
+        continue-on-error: true
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
+
+      # ========== 4) Fail clearly if neither method connected ==========
+      - name: Ensure Tailscale is connected
+        shell: bash
+        run: |
+          set -e
+          echo "OAuth outcome:  ${{ steps.ts_oauth.outcome }}"
+          echo "AuthKey outcome: ${{ steps.ts_auth.outcome }}"
+          # Quick status check (tailscale binary is in PATH from the action)
+          if ! command -v tailscale >/dev/null 2>&1; then
+            echo "❌ Tailscale CLI not found (action failed early)"; exit 1
+          fi
+          tailscale status || true
+          # Require at least one success
+          if [[ "${{ steps.ts_oauth.outcome }}" != "success" && "${{ steps.ts_auth.outcome }}" != "success" ]]; then
+            echo "❌ Could not connect to Tailscale via OAuth or AuthKey."
+            echo "   - Double-check TS_OAUTH_CLIENT_ID/SECRET or provide an Ephemeral, Preauthorized TS_AUTHKEY."
+            exit 1
+          fi
+          echo "✅ Connected to Tailscale."
+
+      # ========== 5) Preflight SSH on selected color ==========
+      - name: Preflight (BLUE)
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -92,8 +136,7 @@ jobs:
             docker --version || (echo "Docker not installed" && exit 1)
             mkdir -p /home/${USER}/app/myapp_blue
 
-      # ==================== GREEN path: ensure target dir + preflight ====================
-      - name: Preflight (GREEN) — ensure dir and check Docker
+      - name: Preflight (GREEN)
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -107,7 +150,7 @@ jobs:
             docker --version || (echo "Docker not installed" && exit 1)
             mkdir -p /home/${USER}/app/myapp_green
 
-      # ---- Render docker-compose.yml ON THE RUNNER (no secrets inside the file)
+      # ========== 6) Render docker-compose.yml ON THE RUNNER ==========
       - name: Render docker-compose.yml
         run: |
           mkdir -p "$RUNNER_TEMP/deploy"
@@ -137,7 +180,7 @@ jobs:
           YAML
           echo "Rendered: $RUNNER_TEMP/deploy/docker-compose.yml"
 
-      # ---- Upload compose to BLUE/GREEN using SCP (path was created in preflight)
+      # ========== 7) Upload compose to target ==========
       - name: Upload compose to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/scp-action@v0.1.7
@@ -160,7 +203,7 @@ jobs:
           target:   /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green/
           overwrite: true
 
-      # ==================== Deploy to BLUE ====================
+      # ========== 8) Deploy ==========
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -172,11 +215,8 @@ jobs:
           script: |
             set -e
             cd /home/${USER}/app/myapp_blue
-
-            # If GHCR packages are PRIVATE, uncomment the next line and add GHCR_USERNAME + GHCR_TOKEN (read:packages) to Environment secrets:
+            # If GHCR is private, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
-
-            # .env contains runtime secrets (compose reads via --env-file)
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -185,13 +225,11 @@ jobs:
             DB_PASSWORD=${{ secrets.DB_PASSWORD }}
             DB_NAME=${{ secrets.DB_NAME }}
             EOF
-
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
             curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ==================== Deploy to GREEN ====================
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -203,10 +241,8 @@ jobs:
           script: |
             set -e
             cd /home/${USER}/app/myapp_green
-
-            # If GHCR packages are PRIVATE, uncomment:
+            # If GHCR is private, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
-
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -215,13 +251,12 @@ jobs:
             DB_PASSWORD=${{ secrets.DB_PASSWORD }}
             DB_NAME=${{ secrets.DB_NAME }}
             EOF
-
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
             curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ==================== Optional: switch proxy to color ====================
+      # ========== 9) Switch proxy (optional) ==========
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
