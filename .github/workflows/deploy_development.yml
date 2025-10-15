@@ -1,4 +1,4 @@
-name: Deploy (Development)
+name: Deploy (Development, hardened)
 
 on:
   workflow_dispatch:
@@ -34,7 +34,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1) Validate Tailscale OAuth secrets are present and well-formed
+      - name: Validate SSH host formatting (no :port, no user@, no scheme)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pick_host() {
+            if [ "${{ inputs.color }}" = "blue" ]; then
+              echo "${{ secrets.APP_BLUE_SSH_HOST }}"
+            else
+              echo "${{ secrets.APP_GREEN_SSH_HOST }}"
+            fi
+          }
+          H="$(pick_host)"
+          if [[ -z "$H" ]]; then echo "❌ SSH host secret is empty."; exit 1; fi
+          if [[ "$H" =~ : ]]; then echo "❌ SSH host must NOT contain a colon or port (put port in 'port:' input). Current value looks like it has :"; exit 1; fi
+          if [[ "$H" =~ @ ]]; then echo "❌ Do not embed username in host. Provide it via 'username:' input."; exit 1; fi
+          if [[ "$H" =~ ^ssh:// ]]; then echo "❌ Do not prefix with ssh://"; exit 1; fi
+          if [[ "$H" =~ / ]]; then echo "❌ Host should not contain slashes."; exit 1; fi
+          echo "✅ SSH host format looks OK."
+
       - name: Validate Tailscale OAuth secrets
         shell: bash
         env:
@@ -47,7 +65,6 @@ jobs:
           case "$TS_SECRET" in tskey-secret-*) : ;; *) echo "TS_OAUTH_CLIENT_SECRET should start with 'tskey-secret-'" >&2; exit 1 ;; esac
           echo "✅ Tailscale OAuth secrets look valid."
 
-      # 2) Connect to Tailscale (OAuth primary)
       - name: Connect to Tailscale (OAuth)
         id: ts_oauth
         continue-on-error: true
@@ -57,7 +74,6 @@ jobs:
           oauth-secret:     ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
           args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
 
-      # 3) Fallback: Connect to Tailscale using an Ephemeral + Preauthorized auth key
       - name: Connect to Tailscale (AuthKey fallback)
         id: ts_auth
         if: ${{ steps.ts_oauth.outcome != 'success' }}
@@ -81,28 +97,30 @@ jobs:
           fi
           echo "✅ Connected to Tailscale."
 
-      # 4) Preflight to BLUE/GREEN: ensure Docker + target dir (use explicit /home/<user> path)
-      - name: Preflight (BLUE) — check Docker & prepare path
+      - name: Preflight (BLUE) — Docker & path
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}     # Use the VM's Tailscale 100.x IP in this secret
+          host:     ${{ secrets.APP_BLUE_SSH_HOST }}
           username: ${{ secrets.APP_BLUE_SSH_USER }}
           key:      ${{ secrets.APP_BLUE_SSH_KEY }}
+          port: 22
+          debug: true
           script_stop: true
-          script: bash -lc 'set -e; echo "Connected to BLUE"; hostname; uname -a; docker --version || (echo "Docker not installed" && exit 1); mkdir -p /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue'
+          script: bash -lc 'set -e; echo Connected to BLUE; hostname; uname -a; docker --version || (echo Docker not installed && exit 1); mkdir -p /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue'
 
-      - name: Preflight (GREEN) — check Docker & prepare path
+      - name: Preflight (GREEN) — Docker & path
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}    # Use the VM's Tailscale 100.x IP in this secret
+          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
           username: ${{ secrets.APP_GREEN_SSH_USER }}
           key:      ${{ secrets.APP_GREEN_SSH_KEY }}
+          port: 22
+          debug: true
           script_stop: true
-          script: bash -lc 'set -e; echo "Connected to GREEN"; hostname; uname -a; docker --version || (echo "Docker not installed" && exit 1); mkdir -p /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green'
+          script: bash -lc 'set -e; echo Connected to GREEN; hostname; uname -a; docker --version || (echo Docker not installed && exit 1); mkdir -p /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green'
 
-      # 5) Render docker-compose.yml INSIDE the repo workspace (scp-action can see it)
       - name: Render docker-compose.yml
         run: |
           set -e
@@ -128,7 +146,6 @@ jobs:
           YAML
           ls -l deploy/docker-compose.yml
 
-      # 6) Upload compose to BLUE/GREEN via SCP (workspace path + 100.x host)
       - name: Upload compose to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/scp-action@v0.1.7
@@ -136,6 +153,7 @@ jobs:
           host:     ${{ secrets.APP_BLUE_SSH_HOST }}
           username: ${{ secrets.APP_BLUE_SSH_USER }}
           key:      ${{ secrets.APP_BLUE_SSH_KEY }}
+          port: 22
           source:   "deploy/docker-compose.yml"
           target:   "/home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue/"
           overwrite: true
@@ -148,12 +166,12 @@ jobs:
           host:     ${{ secrets.APP_GREEN_SSH_HOST }}
           username: ${{ secrets.APP_GREEN_SSH_USER }}
           key:      ${{ secrets.APP_GREEN_SSH_KEY }}
+          port: 22
           source:   "deploy/docker-compose.yml"
           target:   "/home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green/"
           overwrite: true
           debug: true
 
-      # 7) Deploy to BLUE/GREEN using a single-line script (avoids YAML parser issues)
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -161,20 +179,11 @@ jobs:
           host:     ${{ secrets.APP_BLUE_SSH_HOST }}
           username: ${{ secrets.APP_BLUE_SSH_USER }}
           key:      ${{ secrets.APP_BLUE_SSH_KEY }}
+          port: 22
+          debug: true
           script_stop: true
           command_timeout: 10m
-          script: >
-            bash -lc 'set -e; cd /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue;
-            echo "TAG=${{ inputs.tag }}" > .env;
-            echo "DB_HOST=${{ secrets.DB_HOST }}" >> .env;
-            echo "DB_PORT=${{ secrets.DB_PORT }}" >> .env;
-            echo "DB_USER=${{ secrets.DB_USER }}" >> .env;
-            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env;
-            echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env;
-            docker compose --env-file .env pull;
-            docker compose --env-file .env up -d --remove-orphans;
-            sleep 3;
-            if ! curl -fsS http://localhost/api/health; then docker compose logs --no-color --tail=200; exit 1; fi'
+          script: bash -lc 'set -e; cd /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue; : > .env; echo TAG=${{ inputs.tag }} >> .env; echo DB_HOST=${{ secrets.DB_HOST }} >> .env; echo DB_PORT=${{ secrets.DB_PORT }} >> .env; echo DB_USER=${{ secrets.DB_USER }} >> .env; echo DB_PASSWORD=${{ secrets.DB_PASSWORD }} >> .env; echo DB_NAME=${{ secrets.DB_NAME }} >> .env; docker compose --env-file .env pull; docker compose --env-file .env up -d --remove-orphans; sleep 3; curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)'
 
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
@@ -183,22 +192,12 @@ jobs:
           host:     ${{ secrets.APP_GREEN_SSH_HOST }}
           username: ${{ secrets.APP_GREEN_SSH_USER }}
           key:      ${{ secrets.APP_GREEN_SSH_KEY }}
+          port: 22
+          debug: true
           script_stop: true
           command_timeout: 10m
-          script: >
-            bash -lc 'set -e; cd /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green;
-            echo "TAG=${{ inputs.tag }}" > .env;
-            echo "DB_HOST=${{ secrets.DB_HOST }}" >> .env;
-            echo "DB_PORT=${{ secrets.DB_PORT }}" >> .env;
-            echo "DB_USER=${{ secrets.DB_USER }}" >> .env;
-            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env;
-            echo "DB_NAME=${{ secrets.DB_NAME }}" >> .env;
-            docker compose --env-file .env pull;
-            docker compose --env-file .env up -d --remove-orphans;
-            sleep 3;
-            if ! curl -fsS http://localhost/api/health; then docker compose logs --no-color --tail=200; exit 1; fi'
+          script: bash -lc 'set -e; cd /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green; : > .env; echo TAG=${{ inputs.tag }} >> .env; echo DB_HOST=${{ secrets.DB_HOST }} >> .env; echo DB_PORT=${{ secrets.DB_PORT }} >> .env; echo DB_USER=${{ secrets.DB_USER }} >> .env; echo DB_PASSWORD=${{ secrets.DB_PASSWORD }} >> .env; echo DB_NAME=${{ secrets.DB_NAME }} >> .env; docker compose --env-file .env pull; docker compose --env-file .env up -d --remove-orphans; sleep 3; curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)'
 
-      # 8) Optionally switch the proxy to the selected color
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -206,10 +205,7 @@ jobs:
           host:     ${{ secrets.PROXY_SSH_HOST }}
           username: ${{ secrets.PROXY_SSH_USER }}
           key:      ${{ secrets.PROXY_SSH_KEY }}
+          port: 22
+          debug: true
           script_stop: true
-          script: >
-            bash -lc 'set -e; COLOR=${{ inputs.color }};
-            sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf;
-            sudo nginx -t;
-            sudo systemctl reload nginx;
-            curl -fsS http://localhost/api/health || (echo "Proxy smoke test failed" && exit 1)'
+          script: bash -lc 'set -e; COLOR=${{ inputs.color }}; sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf; sudo nginx -t; sudo systemctl reload nginx; curl -fsS http://localhost/api/health || (echo Proxy smoke test failed && exit 1)'
