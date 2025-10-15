@@ -65,7 +65,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret:     ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
           # Remove 'tags' if you haven't added tag:ci in your ACLs/tagOwners
-          tags: tag:ci
+          tags: tag:ci-dev
           args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
 
       # (Optional) GHCR login if your images are private:
