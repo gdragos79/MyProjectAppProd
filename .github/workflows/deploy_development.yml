@@ -43,40 +43,39 @@ permissions:
 
 jobs:
   deploy:
+    # GitHub-hosted runner is fine because Tailscale gives it secure reachability
     runs-on: ubuntu-latest
     environment: Development
     concurrency:
       group: deploy-development
       cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@v4
-jobs:
-  deploy:
-    runs-on: ubuntu-latest        # stays GitHub-hosted now
-    environment: Development
+
     steps:
       - uses: actions/checkout@v4
 
+      # --- Join your tailnet with an ephemeral key stored as secret TS_AUTHKEY ---
+      # Prereq (Option A):
+      #   * Tailscale installed & logged-in on BLUE/GREEN/PROXY VMs
+      #   * APP_*_SSH_HOST secrets point to their MagicDNS names (or 100.x IPs)
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
           args: --timeout=2m --accept-routes
-          # if you enabled MagicDNS, it just works; otherwise use 100.x IPs
 
-
-      # ---- If your GHCR images are PRIVATE, uncomment this step and add GHCR_USERNAME + GHCR_TOKEN secrets to the Development environment ----
-      # - name: Login to GHCR (optional for private images)
+      # --- If your GHCR images are PRIVATE, uncomment the next step and
+      #     add GHCR_USERNAME & GHCR_TOKEN (read:packages) to the Development env.
+      # - name: Login to GHCR (runner; sometimes useful for preflight pulls)
       #   run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
-      # ---------------- BLUE ----------------
+      # -------------------- Deploy to BLUE --------------------
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}
-          username: ${{ secrets.APP_BLUE_SSH_USER }}
-          key:      ${{ secrets.APP_BLUE_SSH_KEY }}
+          host:     ${{ secrets.APP_BLUE_SSH_HOST }}   # MagicDNS or 100.x of BLUE
+          username: ${{ secrets.APP_BLUE_SSH_USER }}   # e.g., deploy
+          key:      ${{ secrets.APP_BLUE_SSH_KEY }}    # full private key (multiline OK)
           script_stop: true
           script: |
             set -e
@@ -84,7 +83,10 @@ jobs:
             mkdir -p ~/app/$STACK
             cd ~/app/$STACK
 
-            # .env is built from GHA environment secrets (resolved on the runner, not on the VM)
+            # If GHCR packages are PRIVATE, uncomment the next line and add GHCR secrets:
+            # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+
+            # Compose env (variables used in docker-compose.yml)
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -94,7 +96,7 @@ jobs:
             DB_NAME=${{ secrets.DB_NAME }}
             EOF
 
-            # runtime compose (frontend serves static, proxies /api to backend)
+            # Production runtime compose (frontend serves static; proxies /api -> backend)
             cat > docker-compose.yml <<'YAML'
             services:
               frontend:
@@ -120,20 +122,17 @@ jobs:
                   retries: 5
             YAML
 
-            # If images are private, uncomment GHCR login here too (and add GHCR_USERNAME/TOKEN secrets):
-            # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
-
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
             curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ---------------- GREEN ----------------
+      # -------------------- Deploy to GREEN --------------------
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
+          host:     ${{ secrets.APP_GREEN_SSH_HOST }}  # MagicDNS or 100.x of GREEN
           username: ${{ secrets.APP_GREEN_SSH_USER }}
           key:      ${{ secrets.APP_GREEN_SSH_KEY }}
           script_stop: true
@@ -143,6 +142,9 @@ jobs:
             mkdir -p ~/app/$STACK
             cd ~/app/$STACK
 
+            # If GHCR packages are PRIVATE, uncomment the next line and add GHCR secrets:
+            # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -177,20 +179,17 @@ jobs:
                   retries: 5
             YAML
 
-            # If images are private, uncomment GHCR login here too:
-            # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
-
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
             curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ---------------- SWITCH TRAFFIC (Proxy VM) ----------------
+      # -------------------- Switch traffic on Proxy VM --------------------
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.PROXY_SSH_HOST }}
+          host:     ${{ secrets.PROXY_SSH_HOST }}       # MagicDNS or 100.x of PROXY
           username: ${{ secrets.PROXY_SSH_USER }}
           key:      ${{ secrets.PROXY_SSH_KEY }}
           script_stop: true
@@ -200,4 +199,5 @@ jobs:
             sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf
             sudo nginx -t
             sudo systemctl reload nginx
+            # Optional smoke test through proxy box itself
             curl -fsS http://localhost/api/health || (echo "Proxy smoke test failed" && exit 1)
