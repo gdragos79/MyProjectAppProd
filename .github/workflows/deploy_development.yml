@@ -7,18 +7,6 @@ on:
         description: "Image tag to deploy (sha7 or 'latest')"
         required: true
         default: "latest"
-      color:
-        description: "Which color to deploy to?"
-        required: true
-        default: "blue"
-        type: choice
-        options: ["blue", "green"]
-      switch_traffic:
-        description: "Also switch the proxy to this color?"
-        required: true
-        default: "false"
-        type: choice
-        options: ["false", "true"]
 
 permissions:
   contents: read
@@ -26,120 +14,58 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: Development
+    environment: Development       # uses Development environment & its secrets
     concurrency:
       group: deploy-development
       cancel-in-progress: true
-
     steps:
-      - uses: actions/checkout@v4
+      - name: SSH & Deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key:      ${{ secrets.SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            mkdir -p ~/app
+            cd ~/app
 
-      # --- 0) Optional: quick validation to avoid common 'host' formatting errors ---
-      - name: Validate SSH host formatting
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          pick_host() {
-            if [ "${{ inputs.color }}" = "blue" ]; then
-              echo "${{ secrets.APP_BLUE_SSH_HOST }}"
-            else
-              echo "${{ secrets.APP_GREEN_SSH_HOST }}"
+            # write .env from environment secrets
+            cat > .env <<'EOF'
+            TAG=${{ github.event.inputs.tag }}
+            DB_HOST=${{ secrets.DB_HOST }}
+            DB_PORT=${{ secrets.DB_PORT }}
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+            DB_NAME=${{ secrets.DB_NAME }}
+            EOF
+
+            # write docker-compose.yml if not present (first time)
+            if [ ! -f docker-compose.yml ]; then
+              cat > docker-compose.yml <<'YAML'
+            version: "3.8"
+            services:
+              frontend:
+                image: ghcr.io/${{ github.repository }}-frontend:${TAG:-latest}
+                ports:
+                  - "80:80"
+                depends_on:
+                  - backend
+
+              backend:
+                image: ghcr.io/${{ github.repository }}-backend:${TAG:-latest}
+                environment:
+                  DB_HOST: ${DB_HOST}
+                  DB_PORT: ${DB_PORT}
+                  DB_USER: ${DB_USER}
+                  DB_PASSWORD: ${DB_PASSWORD}
+                  DB_NAME: ${DB_NAME}
+                ports:
+                  - "3000:3000"
+            YAML
             fi
-          }
-          H="$(pick_host)"
-          if [[ -z "$H" ]]; then echo "❌ SSH host secret is empty"; exit 1; fi
-          if [[ "$H" =~ : ]]; then echo "❌ SSH host must NOT contain :port (put port in the 'port:' input)"; exit 1; fi
-          if [[ "$H" =~ @ ]]; then echo "❌ Do not embed username in host (use the 'username:' input)"; exit 1; fi
-          if [[ "$H" =~ ^ssh:// ]]; then echo "❌ Do not use ssh:// prefix"; exit 1; fi
-          if [[ "$H" =~ / ]]; then echo "❌ Host should not contain slashes"; exit 1; fi
-          echo "✅ SSH host looks OK."
 
-      # --- 1) SSH Smoke Tests (BEFORE the real deploy) ---
-      - name: SSH smoke test (BLUE)
-        if: ${{ inputs.color == 'blue' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}     # host only (no :22, no user@)
-          username: ${{ secrets.APP_BLUE_SSH_USER }}
-          key:      ${{ secrets.APP_BLUE_SSH_KEY }}
-          port: 22
-          debug: true
-          script_stop: true
-          script: bash -lc 'echo OK from $(hostname); uname -a'
-
-      - name: SSH smoke test (GREEN)
-        if: ${{ inputs.color == 'green' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
-          username: ${{ secrets.APP_GREEN_SSH_USER }}
-          key:      ${{ secrets.APP_GREEN_SSH_KEY }}
-          port: 22
-          debug: true
-          script_stop: true
-          script: bash -lc 'echo OK from $(hostname); uname -a'
-
-      # --- 2) (Optional) Preflight: ensure Docker exists and target path is ready ---
-      - name: Preflight (BLUE) — Docker & path
-        if: ${{ inputs.color == 'blue' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}
-          username: ${{ secrets.APP_BLUE_SSH_USER }}
-          key:      ${{ secrets.APP_BLUE_SSH_KEY }}
-          port: 22
-          debug: true
-          script_stop: true
-          script: bash -lc 'set -e; echo Connected to BLUE; docker --version || (echo Docker not installed && exit 1); mkdir -p /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue'
-
-      - name: Preflight (GREEN) — Docker & path
-        if: ${{ inputs.color == 'green' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
-          username: ${{ secrets.APP_GREEN_SSH_USER }}
-          key:      ${{ secrets.APP_GREEN_SSH_KEY }}
-          port: 22
-          debug: true
-          script_stop: true
-          script: bash -lc 'set -e; echo Connected to GREEN; docker --version || (echo Docker not installed && exit 1); mkdir -p /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green'
-
-      # --- 3) REAL DEPLOY STEPS ---
-      - name: Deploy to BLUE
-        if: ${{ inputs.color == 'blue' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}
-          username: ${{ secrets.APP_BLUE_SSH_USER }}
-          key:      ${{ secrets.APP_BLUE_SSH_KEY }}
-          port: 22
-          debug: true
-          script_stop: true
-          command_timeout: 10m
-          script: bash -lc 'set -e; cd /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue; : > .env; echo TAG=${{ inputs.tag }} >> .env; echo DB_HOST=${{ secrets.DB_HOST }} >> .env; echo DB_PORT=${{ secrets.DB_PORT }} >> .env; echo DB_USER=${{ secrets.DB_USER }} >> .env; echo DB_PASSWORD=${{ secrets.DB_PASSWORD }} >> .env; echo DB_NAME=${{ secrets.DB_NAME }} >> .env; docker compose --env-file .env pull; docker compose --env-file .env up -d --remove-orphans; sleep 3; curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)'
-
-      - name: Deploy to GREEN
-        if: ${{ inputs.color == 'green' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
-          username: ${{ secrets.APP_GREEN_SSH_USER }}
-          key:      ${{ secrets.APP_GREEN_SSH_KEY }}
-          port: 22
-          debug: true
-          script_stop: true
-          command_timeout: 10m
-          script: bash -lc 'set -e; cd /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green; : > .env; echo TAG=${{ inputs.tag }} >> .env; echo DB_HOST=${{ secrets.DB_HOST }} >> .env; echo DB_PORT=${{ secrets.DB_PORT }} >> .env; echo DB_USER=${{ secrets.DB_USER }} >> .env; echo DB_PASSWORD=${{ secrets.DB_PASSWORD }} >> .env; echo DB_NAME=${{ secrets.DB_NAME }} >> .env; docker compose --env-file .env pull; docker compose --env-file .env up -d --remove-orphans; sleep 3; curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)'
-
-      # --- 4) Optionally switch the proxy (if you have a separate Nginx VM) ---
-      - name: Switch proxy to selected color
-        if: ${{ inputs.switch_traffic == 'true' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host:     ${{ secrets.PROXY_SSH_HOST }}
-          username: ${{ secrets.PROXY_SSH_USER }}
-          key:      ${{ secrets.PROXY_SSH_KEY }}
-          port: 22
-          debug: true
-          script_stop: true
-          script: bash -lc 'set -e; COLOR=${{ inputs.color }}; sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf; sudo nginx -t; sudo systemctl reload nginx; curl -fsS http://localhost/api/health || (echo Proxy smoke test failed && exit 1)'
+            docker compose --env-file .env pull
+            docker compose --env-file .env up -d
+            docker compose ps
