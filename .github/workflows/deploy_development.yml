@@ -43,8 +43,7 @@ permissions:
 
 jobs:
   deploy:
-    # GitHub-hosted runner is fine because Tailscale gives it secure reachability
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest            # GitHub-hosted runner is fine (Tailscale gives reachability)
     environment: Development
     concurrency:
       group: deploy-development
@@ -53,27 +52,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Join your tailnet with an ephemeral key stored as secret TS_AUTHKEY ---
-      # Prereq (Option A):
-      #   * Tailscale installed & logged-in on BLUE/GREEN/PROXY VMs
-      #   * APP_*_SSH_HOST secrets point to their MagicDNS names (or 100.x IPs)
+      # --- Join your tailnet via OAuth client (no deprecation warning, no manual approval) ---
+      # Prereq in Tailscale admin:
+      #   * Create OAuth client → store Client ID/Secret as env secrets below.
+      #   * (Optional) If you set "tags: tag:ci", ensure ACLs grant tag:ci (or remove the 'tags' line).
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
-          args: --timeout=2m --accept-routes
+          oauth-client-id:     ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-client-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          tags: tag:ci
+          args: --timeout=2m --accept-routes --hostname=gha-${{ github.run_id }}
 
-      # --- If your GHCR images are PRIVATE, uncomment the next step and
-      #     add GHCR_USERNAME & GHCR_TOKEN (read:packages) to the Development env.
-      # - name: Login to GHCR (runner; sometimes useful for preflight pulls)
-      #   run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+      # --- If GHCR images are PRIVATE, add GHCR_USERNAME + GHCR_TOKEN (read:packages) to env secrets
+      #     and uncomment the docker login inside each SSH script below.
 
-      # -------------------- Deploy to BLUE --------------------
+      # ==================== DEPLOY TO BLUE ====================
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}   # MagicDNS or 100.x of BLUE
+          host:     ${{ secrets.APP_BLUE_SSH_HOST }}   # Tailscale MagicDNS or 100.x of BLUE
           username: ${{ secrets.APP_BLUE_SSH_USER }}   # e.g., deploy
           key:      ${{ secrets.APP_BLUE_SSH_KEY }}    # full private key (multiline OK)
           script_stop: true
@@ -83,10 +82,10 @@ jobs:
             mkdir -p ~/app/$STACK
             cd ~/app/$STACK
 
-            # If GHCR packages are PRIVATE, uncomment the next line and add GHCR secrets:
+            # If GHCR packages are PRIVATE, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
-            # Compose env (variables used in docker-compose.yml)
+            # Compose env used by docker-compose.yml
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -96,7 +95,7 @@ jobs:
             DB_NAME=${{ secrets.DB_NAME }}
             EOF
 
-            # Production runtime compose (frontend serves static; proxies /api -> backend)
+            # Runtime compose (frontend serves static; proxies /api -> backend)
             cat > docker-compose.yml <<'YAML'
             services:
               frontend:
@@ -104,7 +103,6 @@ jobs:
                 ports:
                   - "80:80"
                 depends_on: [backend]
-
               backend:
                 image: ghcr.io/${{ github.repository }}-backend:${TAG:-latest}
                 environment:
@@ -127,12 +125,12 @@ jobs:
             sleep 3
             curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # -------------------- Deploy to GREEN --------------------
+      # ==================== DEPLOY TO GREEN ====================
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}  # MagicDNS or 100.x of GREEN
+          host:     ${{ secrets.APP_GREEN_SSH_HOST }}  # Tailscale MagicDNS or 100.x of GREEN
           username: ${{ secrets.APP_GREEN_SSH_USER }}
           key:      ${{ secrets.APP_GREEN_SSH_KEY }}
           script_stop: true
@@ -142,7 +140,7 @@ jobs:
             mkdir -p ~/app/$STACK
             cd ~/app/$STACK
 
-            # If GHCR packages are PRIVATE, uncomment the next line and add GHCR secrets:
+            # If GHCR packages are PRIVATE, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
             cat > .env <<'EOF'
@@ -161,7 +159,6 @@ jobs:
                 ports:
                   - "80:80"
                 depends_on: [backend]
-
               backend:
                 image: ghcr.io/${{ github.repository }}-backend:${TAG:-latest}
                 environment:
@@ -184,12 +181,12 @@ jobs:
             sleep 3
             curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # -------------------- Switch traffic on Proxy VM --------------------
+      # ==================== SWITCH TRAFFIC (Proxy VM) ====================
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.PROXY_SSH_HOST }}       # MagicDNS or 100.x of PROXY
+          host:     ${{ secrets.PROXY_SSH_HOST }}       # Tailscale MagicDNS or 100.x of PROXY VM
           username: ${{ secrets.PROXY_SSH_USER }}
           key:      ${{ secrets.PROXY_SSH_KEY }}
           script_stop: true
@@ -199,5 +196,4 @@ jobs:
             sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf
             sudo nginx -t
             sudo systemctl reload nginx
-            # Optional smoke test through proxy box itself
             curl -fsS http://localhost/api/health || (echo "Proxy smoke test failed" && exit 1)
