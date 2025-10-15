@@ -1,0 +1,21 @@
+name: Runner ping
+on: workflow_dispatch
+
+jobs:
+  ping_blue:
+    runs-on: [self-hosted, linux, app-blue]
+    steps:
+      - run: |
+          whoami
+          uname -a
+          docker --version
+          docker compose version
+
+  ping_green:
+    runs-on: [self-hosted, linux, app-green]
+    steps:
+      - run: |
+          whoami
+          uname -a
+          docker --version
+          docker compose version
