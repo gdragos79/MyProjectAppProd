@@ -40,20 +40,12 @@ jobs:
           authkey: ${{ secrets.TS_AUTHKEY }}
           args: --timeout=2m --accept-routes
 
-      - name: Set deployment secrets
-        run: |
-          if [ "${{ inputs.color }}" = "blue" ]; then
-            echo "HOST=${{ secrets.APP_BLUE_SSH_HOST }}" >> $GITHUB_ENV
-            echo "USER=${{ secrets.APP_BLUE_SSH_USER }}" >> $GITHUB_ENV
-            echo "KEY=${{ secrets.APP_BLUE_SSH_KEY }}" >> $GITHUB_ENV
-          else
-            echo "HOST=${{ secrets.APP_GREEN_SSH_HOST }}" >> $GITHUB_ENV
-            echo "USER=${{ secrets.APP_GREEN_SSH_USER }}" >> $GITHUB_ENV
-            echo "KEY=${{ secrets.APP_GREEN_SSH_KEY }}" >> $GITHUB_ENV
-          fi
-
       - name: Deploy to selected color
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          HOST: ${{ inputs.color == 'blue' && secrets.APP_BLUE_SSH_HOST || secrets.APP_GREEN_SSH_HOST }}
+          USER: ${{ inputs.color == 'blue' && secrets.APP_BLUE_SSH_USER || secrets.APP_GREEN_SSH_USER }}
+          KEY: ${{ inputs.color == 'blue' && secrets.APP_BLUE_SSH_KEY || secrets.APP_GREEN_SSH_KEY }}
         with:
           host: ${{ env.HOST }}
           username: ${{ env.USER }}
