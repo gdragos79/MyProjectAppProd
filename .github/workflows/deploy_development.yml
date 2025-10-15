@@ -38,7 +38,7 @@ jobs:
       - name: Validate SSH host formatting
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           pick_host() {
             if [ "${{ inputs.color }}" = "blue" ]; then
               echo "${{ secrets.APP_BLUE_SSH_HOST }}"
@@ -54,7 +54,7 @@ jobs:
           if [[ "$H" =~ / ]]; then echo "❌ Host should not contain slashes"; exit 1; fi
           echo "✅ SSH host looks OK."
 
-      # --- 1) SSH Smoke Tests (add these BEFORE the real deploy) ---
+      # --- 1) SSH Smoke Tests (BEFORE the real deploy) ---
       - name: SSH smoke test (BLUE)
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
