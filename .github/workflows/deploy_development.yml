@@ -43,7 +43,7 @@ permissions:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest            # GitHub-hosted runner is fine (Tailscale gives reachability)
+    runs-on: ubuntu-latest
     environment: Development
     concurrency:
       group: deploy-development
@@ -52,29 +52,83 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Join your tailnet via OAuth client (no deprecation warning, no manual approval) ---
-      # Prereq in Tailscale admin:
-      #   * Create OAuth client → store Client ID/Secret as env secrets below.
-      #   * (Optional) If you set "tags: tag:ci", ensure ACLs grant tag:ci (or remove the 'tags' line).
+      # 1) Connect the GitHub runner to your tailnet via OAuth client.
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
           oauth-client-id:     ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-client-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          # Remove the next line if your ACLs don't define/allow tag:ci
           tags: tag:ci
-          args: --timeout=2m --accept-routes --hostname=gha-${{ github.run_id }}
+          args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
 
-      # --- If GHCR images are PRIVATE, add GHCR_USERNAME + GHCR_TOKEN (read:packages) to env secrets
-      #     and uncomment the docker login inside each SSH script below.
+      # 2) Tailscale diagnostics (DNS + reachability) for the chosen color + proxy.
+      - name: Tailscale diagnostics
+        shell: bash
+        run: |
+          set -x
+          tailscale version || true
+          tailscale status || true
+          echo "Runner Tailscale IPv4:"
+          tailscale ip -4 || true
 
-      # ==================== DEPLOY TO BLUE ====================
+          # pick hosts based on color
+          if [ "${{ inputs.color }}" = "blue" ]; then
+            APP_HOST="${{ secrets.APP_BLUE_SSH_HOST }}"
+          else
+            APP_HOST="${{ secrets.APP_GREEN_SSH_HOST }}"
+          fi
+          PROXY_HOST="${{ secrets.PROXY_SSH_HOST }}"
+
+          echo "DNS resolution (getent) for APP_HOST=$APP_HOST"
+          getent ahosts "$APP_HOST" || true
+
+          echo "tailscale ping APP_HOST"
+          tailscale ping -c 3 "$APP_HOST" || true
+
+          echo "ICMP ping APP_HOST"
+          ping -c 3 "$APP_HOST" || true
+
+          echo "DNS resolution for PROXY_HOST=$PROXY_HOST"
+          getent ahosts "$PROXY_HOST" || true
+          echo "tailscale ping PROXY_HOST"
+          tailscale ping -c 3 "$PROXY_HOST" || true
+
+      # 3) Quick SSH preflight to ensure keys + SSH + Docker on target VM are OK.
+      - name: Preflight SSH (color target)
+        if: ${{ inputs.color == 'blue' }}
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.APP_BLUE_SSH_HOST }}
+          username: ${{ secrets.APP_BLUE_SSH_USER }}
+          key:      ${{ secrets.APP_BLUE_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            echo "Connected to BLUE"; hostname; uname -a
+            docker --version || (echo "Docker not installed" && exit 1)
+
+      - name: Preflight SSH (color target)
+        if: ${{ inputs.color == 'green' }}
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key:      ${{ secrets.APP_GREEN_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            echo "Connected to GREEN"; hostname; uname -a
+            docker --version || (echo "Docker not installed" && exit 1)
+
+      # -------------------- DEPLOY TO BLUE --------------------
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}   # Tailscale MagicDNS or 100.x of BLUE
-          username: ${{ secrets.APP_BLUE_SSH_USER }}   # e.g., deploy
-          key:      ${{ secrets.APP_BLUE_SSH_KEY }}    # full private key (multiline OK)
+          host:     ${{ secrets.APP_BLUE_SSH_HOST }}
+          username: ${{ secrets.APP_BLUE_SSH_USER }}
+          key:      ${{ secrets.APP_BLUE_SSH_KEY }}
           script_stop: true
           script: |
             set -e
@@ -82,10 +136,9 @@ jobs:
             mkdir -p ~/app/$STACK
             cd ~/app/$STACK
 
-            # If GHCR packages are PRIVATE, uncomment:
+            # If GHCR packages are PRIVATE, uncomment the next line and add GHCR_USERNAME + GHCR_TOKEN env secrets:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
-            # Compose env used by docker-compose.yml
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -95,7 +148,6 @@ jobs:
             DB_NAME=${{ secrets.DB_NAME }}
             EOF
 
-            # Runtime compose (frontend serves static; proxies /api -> backend)
             cat > docker-compose.yml <<'YAML'
             services:
               frontend:
@@ -123,14 +175,14 @@ jobs:
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
-            curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
+            curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ==================== DEPLOY TO GREEN ====================
+      # -------------------- DEPLOY TO GREEN --------------------
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}  # Tailscale MagicDNS or 100.x of GREEN
+          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
           username: ${{ secrets.APP_GREEN_SSH_USER }}
           key:      ${{ secrets.APP_GREEN_SSH_KEY }}
           script_stop: true
@@ -179,14 +231,14 @@ jobs:
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
-            curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
+            curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ==================== SWITCH TRAFFIC (Proxy VM) ====================
+      # -------------------- SWITCH TRAFFIC (Proxy VM) --------------------
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.PROXY_SSH_HOST }}       # Tailscale MagicDNS or 100.x of PROXY VM
+          host:     ${{ secrets.PROXY_SSH_HOST }}
           username: ${{ secrets.PROXY_SSH_USER }}
           key:      ${{ secrets.PROXY_SSH_KEY }}
           script_stop: true
@@ -196,4 +248,4 @@ jobs:
             sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf
             sudo nginx -t
             sudo systemctl reload nginx
-            curl -fsS http://localhost/api/health || (echo "Proxy smoke test failed" && exit 1)
+            curl -v -fsS http://localhost/api/health || (echo "Proxy smoke test failed" && exit 1)
