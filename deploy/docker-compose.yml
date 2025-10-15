@@ -1,13 +1,13 @@
 # deploy/docker-compose.yml (example)
 services:
   frontend:
-    image: ghcr.io/gdragos79/myprojectappProd-frontend:${TAG:-latest}
+    image: ghcr.io/gdragos79/myprojectappprod-frontend:${TAG:-latest}
     restart: unless-stopped
     ports: ["80:80"]
     depends_on: [backend]
 
   backend:
-    image: ghcr.io/gdragos79/myprojectappProd-backend:${TAG:-latest}
+    image: ghcr.io/gdragos79/myprojectappprod-backend:${TAG:-latest}
     restart: unless-stopped
     env_file: .env
     ports: ["3000:3000"]
