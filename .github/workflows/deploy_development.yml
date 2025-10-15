@@ -209,3 +209,4 @@ jobs:
           debug: true
           script_stop: true
           script: bash -lc 'set -e; COLOR=${{ inputs.color }}; sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf; sudo nginx -t; sudo systemctl reload nginx; curl -fsS http://localhost/api/health || (echo Proxy smoke test failed && exit 1)'
+
