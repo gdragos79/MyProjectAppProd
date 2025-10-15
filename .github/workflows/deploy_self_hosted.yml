@@ -1,0 +1,109 @@
+name: Deploy (self-hosted, Blue/Green)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag (e.g., latest or sha7)
+        required: true
+        default: latest
+      color:
+        description: Which color to deploy?
+        required: true
+        default: blue
+        type: choice
+        options: [blue, green]
+      switch_traffic:
+        description: Switch proxy to this color after deploy?
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+  packages: read   # allows docker/login-action to pull from GHCR using GITHUB_TOKEN
+
+env:
+  COMPOSE_FILE: deploy/docker-compose.yml
+  # Change HEALTH_URL to http://localhost:3000/health if your backend exposes /health directly
+  HEALTH_URL: http://localhost/api/health
+
+jobs:
+  deploy_blue:
+    if: ${{ inputs.color == 'blue' }}
+    runs-on: [self-hosted, linux, app-blue]
+    environment: Development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR (pull auth)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write .env
+        run: |
+          : > .env
+          echo TAG=${{ inputs.tag }} >> .env
+          echo DB_HOST=${{ secrets.DB_HOST }} >> .env
+          echo DB_PORT=${{ secrets.DB_PORT }} >> .env
+          echo DB_USER=${{ secrets.DB_USER }} >> .env
+          echo DB_PASSWORD=${{ secrets.DB_PASSWORD }} >> .env
+          echo DB_NAME=${{ secrets.DB_NAME }} >> .env
+
+      - name: Deploy
+        run: |
+          set -e
+          docker compose --env-file .env -f "$COMPOSE_FILE" pull
+          docker compose --env-file .env -f "$COMPOSE_FILE" up -d --remove-orphans
+          sleep 3
+          curl -fsS "$HEALTH_URL" || (docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200; exit 1)
+
+  deploy_green:
+    if: ${{ inputs.color == 'green' }}
+    runs-on: [self-hosted, linux, app-green]
+    environment: Development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR (pull auth)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write .env
+        run: |
+          : > .env
+          echo TAG=${{ inputs.tag }} >> .env
+          echo DB_HOST=${{ secrets.DB_HOST }} >> .env
+          echo DB_PORT=${{ secrets.DB_PORT }} >> .env
+          echo DB_USER=${{ secrets.DB_USER }} >> .env
+          echo DB_PASSWORD=${{ secrets.DB_PASSWORD }} >> .env
+          echo DB_NAME=${{ secrets.DB_NAME }} >> .env
+
+      - name: Deploy
+        run: |
+          set -e
+          docker compose --env-file .env -f "$COMPOSE_FILE" pull
+          docker compose --env-file .env -f "$COMPOSE_FILE" up -d --remove-orphans
+          sleep 3
+          curl -fsS "$HEALTH_URL" || (docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200; exit 1)
+
+  switch_proxy:
+    if: ${{ inputs.switch_traffic == 'true' }}
+    needs: [deploy_blue, deploy_green]
+    runs-on: [self-hosted, linux, proxy]
+    steps:
+      - name: Switch upstream & reload Nginx
+        run: |
+          set -e
+          COLOR="${{ inputs.color }}"
+          sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+          curl -fsS http://localhost/api/health || (echo "Proxy smoke test failed" >&2; exit 1)
