@@ -52,25 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Fail fast if OAuth secrets are missing
-      - name: Check Tailscale OAuth secrets present
-        run: |
-          test -n "${{ secrets.TS_OAUTH_CLIENT_ID }}" || (echo "Missing TS_OAUTH_CLIENT_ID secret" && exit 1)
-          test -n "${{ secrets.TS_OAUTH_CLIENT_SECRET }}" || (echo "Missing TS_OAUTH_CLIENT_SECRET secret" && exit 1)
-
-      # Connect to Tailscale via OAuth client
+      # --- Tailscale OAuth (no tags to avoid ACL issues) ---
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret:     ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
-          # Remove 'tags' if you haven't added tag:ci in your ACLs/tagOwners
-          tags: tag:ci-dev
           args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
-
-      # (Optional) GHCR login if your images are private:
-      # - name: Login to GHCR
-      #   run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
       # --- Preflight SSH to target color ---
       - name: Preflight SSH (BLUE)
@@ -99,7 +87,60 @@ jobs:
             echo "Connected to GREEN"; hostname; uname -a
             docker --version || (echo "Docker not installed" && exit 1)
 
-      # -------------------- Deploy to BLUE --------------------
+      # --- Render docker-compose.yml ON THE RUNNER (no secrets inside) ---
+      - name: Render docker-compose.yml
+        run: |
+          mkdir -p "$RUNNER_TEMP/deploy"
+          cat > "$RUNNER_TEMP/deploy/docker-compose.yml" <<'YAML'
+          services:
+            frontend:
+              image: ghcr.io/${{ github.repository }}-frontend:${TAG:-latest}
+              ports:
+                - "80:80"
+              depends_on:
+                - backend
+            backend:
+              image: ghcr.io/${{ github.repository }}-backend:${TAG:-latest}
+              environment:
+                DB_HOST: ${DB_HOST}
+                DB_PORT: ${DB_PORT}
+                DB_USER: ${DB_USER}
+                DB_PASSWORD: ${DB_PASSWORD}
+                DB_NAME: ${DB_NAME}
+              ports:
+                - "3000:3000"
+              healthcheck:
+                test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>{if(r.ok)process.exit(0);else process.exit(1)}).catch(()=>process.exit(1))"]
+                interval: 15s
+                timeout: 5s
+                retries: 5
+          YAML
+          echo "Rendered compose at $RUNNER_TEMP/deploy/docker-compose.yml"
+      
+      # --- Upload compose to BLUE/GREEN using SCP (no secrets) ---
+      - name: Upload compose to BLUE
+        if: ${{ inputs.color == 'blue' }}
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host:     ${{ secrets.APP_BLUE_SSH_HOST }}
+          username: ${{ secrets.APP_BLUE_SSH_USER }}
+          key:      ${{ secrets.APP_BLUE_SSH_KEY }}
+          source:   ${{ runner.temp }}/deploy/docker-compose.yml
+          target:   /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue/
+          overwrite: true
+
+      - name: Upload compose to GREEN
+        if: ${{ inputs.color == 'green' }}
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host:     ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key:      ${{ secrets.APP_GREEN_SSH_KEY }}
+          source:   ${{ runner.temp }}/deploy/docker-compose.yml
+          target:   /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green/
+          overwrite: true
+
+      # --- Start/Update stack on BLUE ---
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -114,9 +155,10 @@ jobs:
             mkdir -p ~/app/$STACK
             cd ~/app/$STACK
 
-            # If GHCR is private, uncomment:
+            # If GHCR packages are PRIVATE, uncomment the next line:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
+            # .env contains runtime secrets (not in compose file)
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -126,36 +168,12 @@ jobs:
             DB_NAME=${{ secrets.DB_NAME }}
             EOF
 
-            cat > docker-compose.yml <<'YAML'
-            services:
-              frontend:
-                image: ghcr.io/${{ github.repository }}-frontend:${TAG:-latest}
-                ports:
-                  - "80:80"
-                depends_on: [backend]
-              backend:
-                image: ghcr.io/${{ github.repository }}-backend:${TAG:-latest}
-                environment:
-                  DB_HOST: ${DB_HOST}
-                  DB_PORT: ${DB_PORT}
-                  DB_USER: ${DB_USER}
-                  DB_PASSWORD: ${DB_PASSWORD}
-                  DB_NAME: ${DB_NAME}
-                ports:
-                  - "3000:3000"
-                healthcheck:
-                  test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>{if(r.ok)process.exit(0);else process.exit(1)}).catch(()=>process.exit(1))"]
-                  interval: 15s
-                  timeout: 5s
-                  retries: 5
-            YAML
-
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
             curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # -------------------- Deploy to GREEN --------------------
+      # --- Start/Update stack on GREEN ---
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -170,7 +188,7 @@ jobs:
             mkdir -p ~/app/$STACK
             cd ~/app/$STACK
 
-            # If GHCR is private, uncomment:
+            # If GHCR packages are PRIVATE, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
             cat > .env <<'EOF'
@@ -182,36 +200,12 @@ jobs:
             DB_NAME=${{ secrets.DB_NAME }}
             EOF
 
-            cat > docker-compose.yml <<'YAML'
-            services:
-              frontend:
-                image: ghcr.io/${{ github.repository }}-frontend:${TAG:-latest}
-                ports:
-                  - "80:80"
-                depends_on: [backend]
-              backend:
-                image: ghcr.io/${{ github.repository }}-backend:${TAG:-latest}
-                environment:
-                  DB_HOST: ${DB_HOST}
-                  DB_PORT: ${DB_PORT}
-                  DB_USER: ${DB_USER}
-                  DB_PASSWORD: ${DB_PASSWORD}
-                  DB_NAME: ${DB_NAME}
-                ports:
-                  - "3000:3000"
-                healthcheck:
-                  test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>{if(r.ok)process.exit(0);else process.exit(1)}).catch(()=>process.exit(1))"]
-                  interval: 15s
-                  timeout: 5s
-                  retries: 5
-            YAML
-
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
             curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # -------------------- Switch traffic (Proxy VM) --------------------
+      # --- Optional: switch proxy ---
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
