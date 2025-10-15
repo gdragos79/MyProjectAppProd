@@ -52,7 +52,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Tailscale OAuth (no tags to avoid ACL issues) ---
+      # ---- HARD CHECK: Tailscale OAuth client secrets must be present and well-formed
+      - name: Validate Tailscale OAuth secrets
+        shell: bash
+        env:
+          TS_ID:     ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+        run: |
+          if [ -z "$TS_ID" ]; then
+            echo "Missing TS_OAUTH_CLIENT_ID in Environment: Development" >&2; exit 1
+          fi
+          if [ -z "$TS_SECRET" ]; then
+            echo "Missing TS_OAUTH_CLIENT_SECRET in Environment: Development" >&2; exit 1
+          fi
+          case "$TS_ID" in tskey-client-*) : ;; *) echo "TS_OAUTH_CLIENT_ID should start with 'tskey-client-'" >&2; exit 1 ;; esac
+          case "$TS_SECRET" in tskey-secret-*) : ;; *) echo "TS_OAUTH_CLIENT_SECRET should start with 'tskey-secret-'" >&2; exit 1 ;; esac
+          echo "✅ Tailscale OAuth secrets look valid."
+
+      # ---- Connect the GitHub runner to your tailnet via OAuth client (no manual approval needed)
       - name: Connect to Tailscale
         uses: tailscale/github-action@v3
         with:
@@ -60,8 +77,8 @@ jobs:
           oauth-secret:     ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
           args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
 
-      # --- Preflight SSH to target color ---
-      - name: Preflight SSH (BLUE)
+      # ==================== BLUE path: ensure target dir + preflight ====================
+      - name: Preflight (BLUE) — ensure dir and check Docker
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -73,8 +90,10 @@ jobs:
             set -e
             echo "Connected to BLUE"; hostname; uname -a
             docker --version || (echo "Docker not installed" && exit 1)
+            mkdir -p /home/${USER}/app/myapp_blue
 
-      - name: Preflight SSH (GREEN)
+      # ==================== GREEN path: ensure target dir + preflight ====================
+      - name: Preflight (GREEN) — ensure dir and check Docker
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -86,8 +105,9 @@ jobs:
             set -e
             echo "Connected to GREEN"; hostname; uname -a
             docker --version || (echo "Docker not installed" && exit 1)
+            mkdir -p /home/${USER}/app/myapp_green
 
-      # --- Render docker-compose.yml ON THE RUNNER (no secrets inside) ---
+      # ---- Render docker-compose.yml ON THE RUNNER (no secrets inside the file)
       - name: Render docker-compose.yml
         run: |
           mkdir -p "$RUNNER_TEMP/deploy"
@@ -115,9 +135,9 @@ jobs:
                 timeout: 5s
                 retries: 5
           YAML
-          echo "Rendered compose at $RUNNER_TEMP/deploy/docker-compose.yml"
-      
-      # --- Upload compose to BLUE/GREEN using SCP (no secrets) ---
+          echo "Rendered: $RUNNER_TEMP/deploy/docker-compose.yml"
+
+      # ---- Upload compose to BLUE/GREEN using SCP (path was created in preflight)
       - name: Upload compose to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/scp-action@v0.1.7
@@ -140,7 +160,7 @@ jobs:
           target:   /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green/
           overwrite: true
 
-      # --- Start/Update stack on BLUE ---
+      # ==================== Deploy to BLUE ====================
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -151,14 +171,12 @@ jobs:
           script_stop: true
           script: |
             set -e
-            STACK=myapp_blue
-            mkdir -p ~/app/$STACK
-            cd ~/app/$STACK
+            cd /home/${USER}/app/myapp_blue
 
-            # If GHCR packages are PRIVATE, uncomment the next line:
+            # If GHCR packages are PRIVATE, uncomment the next line and add GHCR_USERNAME + GHCR_TOKEN (read:packages) to Environment secrets:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
-            # .env contains runtime secrets (not in compose file)
+            # .env contains runtime secrets (compose reads via --env-file)
             cat > .env <<'EOF'
             TAG=${{ inputs.tag }}
             DB_HOST=${{ secrets.DB_HOST }}
@@ -173,7 +191,7 @@ jobs:
             sleep 3
             curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # --- Start/Update stack on GREEN ---
+      # ==================== Deploy to GREEN ====================
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -184,9 +202,7 @@ jobs:
           script_stop: true
           script: |
             set -e
-            STACK=myapp_green
-            mkdir -p ~/app/$STACK
-            cd ~/app/$STACK
+            cd /home/${USER}/app/myapp_green
 
             # If GHCR packages are PRIVATE, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
@@ -205,7 +221,7 @@ jobs:
             sleep 3
             curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # --- Optional: switch proxy ---
+      # ==================== Optional: switch proxy to color ====================
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
