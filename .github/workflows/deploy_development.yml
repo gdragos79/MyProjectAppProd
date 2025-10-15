@@ -50,6 +50,20 @@ jobs:
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
+jobs:
+  deploy:
+    runs-on: ubuntu-latest        # stays GitHub-hosted now
+    environment: Development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          args: --timeout=2m --accept-routes
+          # if you enabled MagicDNS, it just works; otherwise use 100.x IPs
+
 
       # ---- If your GHCR images are PRIVATE, uncomment this step and add GHCR_USERNAME + GHCR_TOKEN secrets to the Development environment ----
       # - name: Login to GHCR (optional for private images)
