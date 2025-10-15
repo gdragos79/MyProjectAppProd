@@ -1,21 +1,3 @@
-# This workflow deploys a chosen image tag to either the BLUE or GREEN app VM,
-# then can (optionally) switch the external proxy to route traffic to that color.
-#
-# Required Environment secrets (set per Environment in GitHub → Settings → Environments):
-# - APP_BLUE_SSH_HOST     : IP or hostname of BLUE App VM
-# - APP_BLUE_SSH_USER     : SSH user on BLUE App VM
-# - APP_BLUE_SSH_KEY      : Private key for BLUE App VM
-# - APP_GREEN_SSH_HOST    : IP or hostname of GREEN App VM
-# - APP_GREEN_SSH_USER    : SSH user on GREEN App VM
-# - APP_GREEN_SSH_KEY     : Private key for GREEN App VM
-# - PROXY_SSH_HOST        : IP or hostname of Proxy VM
-# - PROXY_SSH_USER        : SSH user on Proxy VM (must be able to run sudo without password for nginx reload)
-# - PROXY_SSH_KEY         : Private key for Proxy VM
-# - DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME : Database connection for backend
-#
-# Notes:
-# - The proxy is expected to use an Nginx config where a symlink controls the active upstream.
-# - See deploy/proxy/nginx/sites-enabled/README-switch.txt in the starter pack for details.
 name: Deploy (Development)
 
 on:
@@ -52,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- Validate Tailscale OAuth secrets are present and well-formed
+      # 1) Validate Tailscale OAuth secrets are present and well-formed
       - name: Validate Tailscale OAuth secrets
         shell: bash
         env:
@@ -65,7 +47,7 @@ jobs:
           case "$TS_SECRET" in tskey-secret-*) : ;; *) echo "TS_OAUTH_CLIENT_SECRET should start with 'tskey-secret-'" >&2; exit 1 ;; esac
           echo "✅ Tailscale OAuth secrets look valid."
 
-      # ---- Connect to Tailscale (OAuth primary)
+      # 2) Connect to Tailscale (OAuth primary)
       - name: Connect to Tailscale (OAuth)
         id: ts_oauth
         continue-on-error: true
@@ -75,7 +57,7 @@ jobs:
           oauth-secret:     ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
           args: --timeout=2m --accept-routes --accept-dns=true --hostname=gha-${{ github.run_id }}
 
-      # ---- Fallback: Connect to Tailscale using an Ephemeral + Preauthorized auth key
+      # 3) Fallback: Connect to Tailscale using an Ephemeral + Preauthorized auth key
       - name: Connect to Tailscale (AuthKey fallback)
         id: ts_auth
         if: ${{ steps.ts_oauth.outcome != 'success' }}
@@ -99,12 +81,12 @@ jobs:
           fi
           echo "✅ Connected to Tailscale."
 
-      # ---- Preflight to BLUE: ensure Docker + target dir
+      # 4) Preflight to BLUE/GREEN: ensure Docker + target dir (use explicit /home/<user> path)
       - name: Preflight (BLUE) — check Docker & prepare path
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_BLUE_SSH_HOST }}     # Use the VM's Tailscale 100.x IP here (in secret)
+          host:     ${{ secrets.APP_BLUE_SSH_HOST }}     # Use the VM's Tailscale 100.x IP in this secret
           username: ${{ secrets.APP_BLUE_SSH_USER }}
           key:      ${{ secrets.APP_BLUE_SSH_KEY }}
           script_stop: true
@@ -114,12 +96,11 @@ jobs:
             docker --version || (echo "Docker not installed" && exit 1)
             mkdir -p /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue
 
-      # ---- Preflight to GREEN: ensure Docker + target dir
       - name: Preflight (GREEN) — check Docker & prepare path
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.APP_GREEN_SSH_HOST }}    # Use the VM's Tailscale 100.x IP here (in secret)
+          host:     ${{ secrets.APP_GREEN_SSH_HOST }}    # Use the VM's Tailscale 100.x IP in this secret
           username: ${{ secrets.APP_GREEN_SSH_USER }}
           key:      ${{ secrets.APP_GREEN_SSH_KEY }}
           script_stop: true
@@ -129,7 +110,7 @@ jobs:
             docker --version || (echo "Docker not installed" && exit 1)
             mkdir -p /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green
 
-      # ---- Render docker-compose.yml INSIDE the repo workspace (so scp-action can see it)
+      # 5) Render docker-compose.yml INSIDE the repo workspace (scp-action can see it)
       - name: Render docker-compose.yml
         run: |
           set -e
@@ -160,7 +141,7 @@ jobs:
           YAML
           ls -l deploy/docker-compose.yml
 
-      # ---- Upload compose to BLUE via SCP (workspace path + 100.x host)
+      # 6) Upload compose to BLUE/GREEN via SCP (workspace path + 100.x host)
       - name: Upload compose to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/scp-action@v0.1.7
@@ -173,7 +154,6 @@ jobs:
           overwrite: true
           debug: true
 
-      # ---- Upload compose to GREEN via SCP (workspace path + 100.x host)
       - name: Upload compose to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/scp-action@v0.1.7
@@ -186,7 +166,7 @@ jobs:
           overwrite: true
           debug: true
 
-      # ---- Deploy to BLUE using the uploaded compose
+      # 7) Deploy to BLUE/GREEN using the uploaded compose (NO heredocs; use printf)
       - name: Deploy to BLUE
         if: ${{ inputs.color == 'blue' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -198,22 +178,24 @@ jobs:
           script: |
             set -e
             cd /home/${{ secrets.APP_BLUE_SSH_USER }}/app/myapp_blue
-            # If GHCR is private, uncomment:
+            # If GHCR images are PRIVATE, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
-            cat > .env <<'EOF'
-            TAG=${{ inputs.tag }}
-            DB_HOST=${{ secrets.DB_HOST }}
-            DB_PORT=${{ secrets.DB_PORT }}
-            DB_USER=${{ secrets.DB_USER }}
-            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-            DB_NAME=${{ secrets.DB_NAME }}
-            EOF
+
+            # Write .env safely (no heredoc)
+            printf '%s\n' \
+              "TAG=${{ inputs.tag }}" \
+              "DB_HOST=${{ secrets.DB_HOST }}" \
+              "DB_PORT=${{ secrets.DB_PORT }}" \
+              "DB_USER=${{ secrets.DB_USER }}" \
+              "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" \
+              "DB_NAME=${{ secrets.DB_NAME }}" \
+              > .env
+
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
-            curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
+            curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ---- Deploy to GREEN using the uploaded compose
       - name: Deploy to GREEN
         if: ${{ inputs.color == 'green' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -225,22 +207,25 @@ jobs:
           script: |
             set -e
             cd /home/${{ secrets.APP_GREEN_SSH_USER }}/app/myapp_green
-            # If GHCR is private, uncomment:
+            # If GHCR images are PRIVATE, uncomment:
             # echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
-            cat > .env <<'EOF'
-            TAG=${{ inputs.tag }}
-            DB_HOST=${{ secrets.DB_HOST }}
-            DB_PORT=${{ secrets.DB_PORT }}
-            DB_USER=${{ secrets.DB_USER }}
-            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-            DB_NAME=${{ secrets.DB_NAME }}
-            EOF
+
+            # Write .env safely (no heredoc)
+            printf '%s\n' \
+              "TAG=${{ inputs.tag }}" \
+              "DB_HOST=${{ secrets.DB_HOST }}" \
+              "DB_PORT=${{ secrets.DB_PORT }}" \
+              "DB_USER=${{ secrets.DB_USER }}" \
+              "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" \
+              "DB_NAME=${{ secrets.DB_NAME }}" \
+              > .env
+
             docker compose --env-file .env pull
             docker compose --env-file .env up -d --remove-orphans
             sleep 3
-            curl -v -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
+            curl -fsS http://localhost/api/health || (docker compose logs --no-color --tail=200; exit 1)
 
-      # ---- Optionally switch the proxy to the selected color
+      # 8) Optionally switch the proxy to the selected color
       - name: Switch proxy to selected color
         if: ${{ inputs.switch_traffic == 'true' }}
         uses: appleboy/ssh-action@v1.2.0
@@ -255,4 +240,4 @@ jobs:
             sudo ln -sfn /etc/nginx/upstreams/$COLOR.conf /etc/nginx/upstreams/active.conf
             sudo nginx -t
             sudo systemctl reload nginx
-            curl -v -fsS http://localhost/api/health || (echo "Proxy smoke test failed" && exit 1)
+            curl -fsS http://localhost/api/health || (echo "Proxy smoke test failed" && exit 1)
