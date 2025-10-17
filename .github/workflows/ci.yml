@@ -4,8 +4,7 @@ on:
   pull_request:
     branches: [ main, staging, development ]
   push:
-    branches:
-      - '**'            # run CI on pushes to any branch
+    branches: ['**']   # run on pushes to any branch
   workflow_dispatch:
 
 concurrency:
@@ -48,27 +47,39 @@ jobs:
       - run: npm run build --if-present
 
   images:
-    name: Docker Build (validate only; push handled in deploy jobs)
+    name: Docker Build (validate; push only on non-PR)
     needs: [backend, frontend]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     env:
-      IMAGE_FRONTEND: ghcr.io/gdragos79/myprojectappprod-frontend
       IMAGE_BACKEND:  ghcr.io/gdragos79/myprojectappprod-backend
+      IMAGE_FRONTEND: ghcr.io/gdragos79/myprojectappprod-frontend
     steps:
       - uses: actions/checkout@v4
 
-      # Build images to ensure Dockerfiles & contexts are valid.
-      # No login and no push here (deploy workflows will push).
-      - name: Build backend image (no push)
+      - name: Login to GHCR (skip on PR)
+      # we only push on push/workflow_dispatch; PRs build but don't push
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build backend image
         uses: docker/build-push-action@v6
         with:
-          context: ./backend
-          push: false
+          context: backend
+          file: backend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.IMAGE_BACKEND }}:ci-${{ github.run_id }}
 
-      - name: Build frontend image (no push)
+      - name: Build frontend image
         uses: docker/build-push-action@v6
         with:
-          context: ./react
-          push: false
+          context: react
+          file: react/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.IMAGE_FRONTEND }}:ci-${{ github.run_id }}
