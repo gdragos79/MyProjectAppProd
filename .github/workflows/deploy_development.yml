@@ -1,0 +1,107 @@
+name: Deploy — Development (Build/Test → Deploy GREEN, No Flip)
+
+on:
+  push:
+    branches: [ development ]
+
+jobs:
+  build-test-deploy-green:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_FRONTEND: ghcr.io/gdragos79/myprojectappprod-frontend
+      IMAGE_BACKEND: ghcr.io/gdragos79/myprojectappprod-backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Tests first (fail early) ---
+      - name: Backend CI
+        run: |
+          npm -C backend ci
+          npm -C backend test --if-present
+
+      - name: Frontend CI
+        run: |
+          npm -C react ci
+          npm -C react test --if-present -- --watchAll=false
+          npm -C react run build --if-present
+
+      - name: Compute SHORT_SHA
+        id: meta
+        run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      # --- Build & push images if tests passed ---
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+
+      - name: Build & push images (dev: sha tag)
+        run: |
+          docker build -t $IMAGE_BACKEND:sha-${{ steps.meta.outputs.short_sha }} ./backend
+          docker build -t $IMAGE_FRONTEND:sha-${{ steps.meta.outputs.short_sha }} ./react
+          docker push $IMAGE_BACKEND:sha-${{ steps.meta.outputs.short_sha }}
+          docker push $IMAGE_FRONTEND:sha-${{ steps.meta.outputs.short_sha }}
+
+      # --- Always deploy to GREEN only; no proxy flip here ---
+      - name: Deploy to GREEN App VM (staging area)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key: ${{ secrets.APP_GREEN_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            export TAG="sha-${{ steps.meta.outputs.short_sha }}"
+            export DB_HOST="${{ secrets.DB_HOST }}"
+            export DB_PORT="${{ secrets.DB_PORT }}"
+            export DB_USER="${{ secrets.DB_USER }}"
+            export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+            export DB_NAME="${{ secrets.DB_NAME }}"
+            mkdir -p ~/app && cd ~/app
+            cat > docker-compose.yml <<'YAML'
+name: myprojectappprod
+services:
+  frontend:
+    image: ghcr.io/gdragos79/myprojectappprod-frontend:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["80:80"]
+    depends_on: [backend]
+  backend:
+    image: ghcr.io/gdragos79/myprojectappprod-backend:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      PORT: 3000
+      DB_HOST: ${DB_HOST?DB_HOST not set}
+      DB_PORT: ${DB_PORT?DB_PORT not set}
+      DB_USER: ${DB_USER?DB_USER not set}
+      DB_PASSWORD: ${DB_PASSWORD?DB_PASSWORD not set}
+      DB_NAME: ${DB_NAME?DB_NAME not set}
+YAML
+            docker compose up -d --pull always --force-recreate --remove-orphans
+
+      - name: Prisma migrate (GREEN)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key: ${{ secrets.APP_GREEN_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/app
+            docker run --rm --network host               -e DATABASE_URL="postgresql://${{ secrets.DB_USER }}:${{ secrets.DB_PASSWORD }}@${{ secrets.DB_HOST }}:${{ secrets.DB_PORT }}/${{ secrets.DB_NAME }}?schema=public"               -v $PWD:/work -w /work node:20 bash -lc "
+                npm -C backend ci
+                npx -C backend prisma generate
+                npx -C backend prisma migrate deploy
+              "
+
+      - name: Health checks (GREEN)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key: ${{ secrets.APP_GREEN_SSH_KEY }}
+          script: |
+            set -e
+            curl -fsS http://localhost:3000/healthz
+            curl -I http://localhost/

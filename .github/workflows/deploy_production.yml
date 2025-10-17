@@ -1,0 +1,206 @@
+name: Deploy — Production
+
+on:
+  push:
+    tags:
+      - 'rel-*'   # push a rel-YYYY.MM.DD.N tag to trigger
+
+jobs:
+  build-and-deploy-prod:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      IMAGE_FRONTEND: ghcr.io/gdragos79/myprojectappprod-frontend
+      IMAGE_BACKEND: ghcr.io/gdragos79/myprojectappprod-backend
+
+    steps:
+      - name: Checkout (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor $GITHUB_SHA origin/main             || { echo "Tag must point to a commit on 'main'"; exit 1; }
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+
+      - name: Build & push images (release + sha + latest)
+        run: |
+          SHORT_SHA=${GITHUB_SHA::7}
+          TAG="${GITHUB_REF_NAME}"   # the rel-YYYY.MM.DD.N tag
+          docker build -t $IMAGE_BACKEND:$TAG -t $IMAGE_BACKEND:sha-$SHORT_SHA -t $IMAGE_BACKEND:latest ./backend
+          docker build -t $IMAGE_FRONTEND:$TAG -t $IMAGE_FRONTEND:sha-$SHORT_SHA -t $IMAGE_FRONTEND:latest ./react
+          docker push $IMAGE_BACKEND:$TAG
+          docker push $IMAGE_BACKEND:sha-$SHORT_SHA
+          docker push $IMAGE_BACKEND:latest
+          docker push $IMAGE_FRONTEND:$TAG
+          docker push $IMAGE_FRONTEND:sha-$SHORT_SHA
+          docker push $IMAGE_FRONTEND:latest
+
+      - name: Determine idle color from Proxy VM
+        id: color
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.PROXY_SSH_HOST }}
+          username: ${{ secrets.PROXY_SSH_USER }}
+          key: ${{ secrets.PROXY_SSH_KEY }}
+          script: |
+            set -e
+            STATE=/var/lib/myproject/live_color
+            LIVE=blue
+            if [ -f "$STATE" ]; then LIVE=$(cat "$STATE"); fi
+            if [ "$LIVE" = "blue" ]; then echo "target=green"; else echo "target=blue"; fi
+
+      - name: Export TARGET_COLOR
+        run: echo "TARGET_COLOR=$(echo '${{ steps.color.outputs.stdout }}' | awk -F= '{print $2}')" >> $GITHUB_ENV
+
+      - name: Deploy to GREEN App VM
+        if: env.TARGET_COLOR == 'green'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key: ${{ secrets.APP_GREEN_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            mkdir -p ~/app && cd ~/app
+            cat > docker-compose.yml <<'YAML'
+name: myprojectappprod
+services:
+  frontend:
+    image: ghcr.io/gdragos79/myprojectappprod-frontend:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["80:80"]
+    depends_on: [backend]
+  backend:
+    image: ghcr.io/gdragos79/myprojectappprod-backend:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      PORT: 3000
+      DB_HOST: ${DB_HOST?DB_HOST not set}
+      DB_PORT: ${DB_PORT?DB_PORT not set}
+      DB_USER: ${DB_USER?DB_USER not set}
+      DB_PASSWORD: ${DB_PASSWORD?DB_PASSWORD not set}
+      DB_NAME: ${DB_NAME?DB_NAME not set}
+YAML
+            export TAG="${GITHUB_REF_NAME}"
+            export DB_HOST="${{ secrets.DB_HOST }}"
+            export DB_PORT="${{ secrets.DB_PORT }}"
+            export DB_USER="${{ secrets.DB_USER }}"
+            export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+            export DB_NAME="${{ secrets.DB_NAME }}"
+            docker compose up -d --pull always --force-recreate --remove-orphans
+
+      - name: Run Prisma migrate on GREEN
+        if: env.TARGET_COLOR == 'green'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key: ${{ secrets.APP_GREEN_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/app
+            docker run --rm --network host -e DATABASE_URL="postgresql://${{ secrets.DB_USER }}:${{ secrets.DB_PASSWORD }}@${{ secrets.DB_HOST }}:${{ secrets.DB_PORT }}/${{ secrets.DB_NAME }}?schema=public" -v $PWD:/work -w /work node:20 bash -lc "
+              npm -C backend ci
+              npx -C backend prisma generate
+              npx -C backend prisma migrate deploy
+            "
+
+      - name: Health checks on GREEN
+        if: env.TARGET_COLOR == 'green'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_GREEN_SSH_HOST }}
+          username: ${{ secrets.APP_GREEN_SSH_USER }}
+          key: ${{ secrets.APP_GREEN_SSH_KEY }}
+          script: |
+            set -e
+            curl -fsS http://localhost:3000/healthz
+            curl -I http://localhost/
+
+      - name: Deploy to BLUE App VM
+        if: env.TARGET_COLOR == 'blue'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_BLUE_SSH_HOST }}
+          username: ${{ secrets.APP_BLUE_SSH_USER }}
+          key: ${{ secrets.APP_BLUE_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            mkdir -p ~/app && cd ~/app
+            cat > docker-compose.yml <<'YAML'
+name: myprojectappprod
+services:
+  frontend:
+    image: ghcr.io/gdragos79/myprojectappprod-frontend:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["80:80"]
+    depends_on: [backend]
+  backend:
+    image: ghcr.io/gdragos79/myprojectappprod-backend:${TAG:-latest}
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      PORT: 3000
+      DB_HOST: ${DB_HOST?DB_HOST not set}
+      DB_PORT: ${DB_PORT?DB_PORT not set}
+      DB_USER: ${DB_USER?DB_USER not set}
+      DB_PASSWORD: ${DB_PASSWORD?DB_PASSWORD not set}
+      DB_NAME: ${DB_NAME?DB_NAME not set}
+YAML
+            export TAG="${GITHUB_REF_NAME}"
+            export DB_HOST="${{ secrets.DB_HOST }}"
+            export DB_PORT="${{ secrets.DB_PORT }}"
+            export DB_USER="${{ secrets.DB_USER }}"
+            export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+            export DB_NAME="${{ secrets.DB_NAME }}"
+            docker compose up -d --pull always --force-recreate --remove-orphans
+
+      - name: Run Prisma migrate on BLUE
+        if: env.TARGET_COLOR == 'blue'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_BLUE_SSH_HOST }}
+          username: ${{ secrets.APP_BLUE_SSH_USER }}
+          key: ${{ secrets.APP_BLUE_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/app
+            docker run --rm --network host -e DATABASE_URL="postgresql://${{ secrets.DB_USER }}:${{ secrets.DB_PASSWORD }}@${{ secrets.DB_HOST }}:${{ secrets.DB_PORT }}/${{ secrets.DB_NAME }}?schema=public" -v $PWD:/work -w /work node:20 bash -lc "
+              npm -C backend ci
+              npx -C backend prisma generate
+              npx -C backend prisma migrate deploy
+            "
+
+      - name: Health checks on BLUE
+        if: env.TARGET_COLOR == 'blue'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.APP_BLUE_SSH_HOST }}
+          username: ${{ secrets.APP_BLUE_SSH_USER }}
+          key: ${{ secrets.APP_BLUE_SSH_KEY }}
+          script: |
+            set -e
+            curl -fsS http://localhost:3000/healthz
+            curl -I http://localhost/
+
+      - name: Flip proxy to TARGET color
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.PROXY_SSH_HOST }}
+          username: ${{ secrets.PROXY_SSH_USER }}
+          key: ${{ secrets.PROXY_SSH_KEY }}
+          script: |
+            set -e
+            cd /home/gdragos/proxy/nginx/upstreams
+            ln -sfn ../upstream-${TARGET_COLOR}.conf active.conf
+            echo "${TARGET_COLOR}" | sudo tee /var/lib/myproject/live_color
+            cd /home/gdragos/proxy
+            docker compose exec proxy nginx -s reload
