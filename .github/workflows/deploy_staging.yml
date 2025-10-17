@@ -1,19 +1,11 @@
 name: Promote — Staging validates GREEN then flips
 
 on:
-  workflow_dispatch: {}   # run this when UAT is ready
-  # Optionally auto-run after Development completes:
-  # workflow_run:
-  #   workflows: [ "Deploy — Development (Build/Test → Deploy GREEN, No Flip)" ]
-  #   types: [ "completed" ]
+  workflow_dispatch: {}
 
 jobs:
   validate-and-flip:
-    runs-on: ubuntu-latest
-    # If you plan to auto-file an issue on failure, uncomment permissions below
-    # permissions:
-    #   contents: write
-    #   issues: write
+    runs-on: [self-hosted, linux, lan]
 
     steps:
       - name: Show current live color (for context)
@@ -51,12 +43,10 @@ jobs:
           key: ${{ secrets.APP_GREEN_SSH_KEY }}
           script: |
             set -e
-            # Basic health
             curl -fsS http://localhost:3000/healthz
             curl -I http://localhost/
-            # TODO: Add app-specific checks here (e.g., key endpoints, smoke tests)
+            # TODO: add app-specific smoke tests here
 
-      # If we reached here, GREEN is good → flip proxy to GREEN
       - name: Flip proxy to GREEN
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -70,16 +60,3 @@ jobs:
             echo "green" | sudo tee /var/lib/myproject/live_color
             cd /home/gdragos/proxy
             docker compose exec proxy nginx -s reload
-
-      # Example: file an issue back to Dev if any step failed (kept commented by default)
-      # - name: File an issue back to Dev
-      #   if: failure()
-      #   uses: actions/github-script@v7
-      #   with:
-      #     script: |
-      #       github.rest.issues.create({
-      #         owner: context.repo.owner,
-      #         repo: context.repo.repo,
-      #         title: "Staging validation failed",
-      #         body: "Staging checks failed on GREEN. Please investigate and push fixes to development."
-      #       })
