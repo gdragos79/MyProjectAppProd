@@ -1,0 +1,77 @@
+0) (Optional) clean up any plaintext env file
+
+If you previously used /etc/myproject/app.env, you can remove it now:
+
+sudo rm -f /etc/myproject/app.env
+
+1) Create an encrypted credential (machine-bound)
+# 1) Create a temporary env (EDIT VALUES!)
+cat > /tmp/myapp.env <<'ENV'
+DB_HOST=192.168.238.137
+DB_PORT=5432
+DB_USER=your_user
+DB_PASSWORD=your_password
+DB_NAME=your_db
+PORT=3000
+NODE_ENV=production
+# Optional: pin an image tag for autostart, otherwise compose uses :latest
+# TAG=sha-abcdef1
+ENV
+
+# 2) Encrypt & bind to this machine (stores under /etc/credstore.encrypted/)
+sudo systemd-creds encrypt -h machine-id \
+  /tmp/myapp.env /etc/credstore.encrypted/myproject-app.env
+
+# 3) Shred the plaintext
+shred -u /tmp/myapp.env
+
+2) Replace the service to load the encrypted cred
+# Backup your current unit (just in case)
+sudo cp /etc/systemd/system/myproject-app.service /etc/systemd/system/myproject-app.service.bak 2>/dev/null || true
+
+# Install the credential-aware unit
+sudo tee /etc/systemd/system/myproject-app.service >/dev/null <<'UNIT'
+[Unit]
+Description=MyProject App Stack (Blue/Green)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/gdragos/app
+# Decrypts into RAM-only path: /run/credentials/myproject-app.service/app.env
+LoadCredentialEncrypted=app.env:/etc/credstore.encrypted/myproject-app.env
+ExecStart=/usr/bin/docker compose \
+  --env-file /run/credentials/%N/app.env \
+  -f /home/gdragos/app/docker-compose.yml up -d
+ExecStop=/usr/bin/docker compose \
+  --env-file /run/credentials/%N/app.env \
+  -f /home/gdragos/app/docker-compose.yml down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Apply & start
+sudo systemctl daemon-reload
+sudo systemctl enable --now myproject-app
+
+3) One-time GHCR login (if your images are private)
+
+Run this as root on each app VM:
+
+sudo -i
+echo '<YOUR_GHCR_PAT_with_read:packages>' | docker login ghcr.io -u '<your_github_username>' --password-stdin
+exit
+
+4) Verify
+systemctl status myproject-app --no-pager
+docker compose -f /home/gdragos/app/docker-compose.yml ps
+curl -fsS http://localhost:3000/healthz
+
+(Optional) Show the decrypted env (for sanity)
+
+This prints from the RAM path used by systemd (safe to view locally):
+
+sudo systemd-creds cat myproject-app.service app.env
