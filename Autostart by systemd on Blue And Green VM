@@ -22,6 +22,12 @@ ENV
 sudo systemd-creds encrypt -h machine-id \
   /tmp/myapp.env /etc/credstore.encrypted/myproject-app.env
 
+To find the machine-id run:
+cat /etc/machine-id
+hostnamectl | grep 'Machine ID'
+systemd-id128 machine-id
+You’ll get a 32-char hex string (e.g. 947dbc1555244378a216be40769ff0d2). That’s what systemd-creds -h machine-id binds to.
+
 # 3) Shred the plaintext
 shred -u /tmp/myapp.env
 
