@@ -7,6 +7,7 @@ on:
     branches: ['**']   # run on pushes to any branch
   workflow_dispatch:
 
+# Keep runs tidy: one CI per branch at a time
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -20,14 +21,22 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Use Node 20 with npm cache
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
-      - run: npm ci
-      - run: npm test --if-present
-      - run: npm run build --if-present
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Test (if present)
+        run: npm test --if-present
+
+      - name: Build (if present)
+        run: npm run build --if-present
 
   frontend:
     name: Frontend CI
@@ -37,14 +46,22 @@ jobs:
         working-directory: react
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - name: Use Node 20 with npm cache
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: react/package-lock.json
-      - run: npm ci
-      - run: npm test --if-present
-      - run: npm run build --if-present
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Test (if present)
+        run: npm test --if-present
+
+      - name: Build (if present)
+        run: npm run build --if-present
 
   images:
     name: Docker Build (validate; push only on non-PR)
@@ -52,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: write     # required to push to GHCR on push/workflow_dispatch
     env:
       IMAGE_BACKEND:  ghcr.io/gdragos79/myprojectappprod-backend
       IMAGE_FRONTEND: ghcr.io/gdragos79/myprojectappprod-frontend
@@ -60,11 +77,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Debug tree & verify Dockerfiles
+        shell: bash
         run: |
           echo "HEAD=$(git rev-parse --short HEAD)"
           ls -la
+          echo "---- backend ----"
           ls -la backend || true
-          ls -la react   || true
+          echo "---- react ----"
+          ls -la react || true
           test -f backend/Dockerfile || (echo "::error:: missing backend/Dockerfile"; exit 1)
           test -f react/Dockerfile   || (echo "::error:: missing react/Dockerfile"; exit 1)
 
@@ -76,18 +96,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # IMPORTANT: use context="." and file="backend/Dockerfile" (path from repo root)
       - name: Build backend image
         uses: docker/build-push-action@v6
         with:
-          context: backend
-          file: Dockerfile            # relative to the 'backend' context
+          context: .
+          file: backend/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.IMAGE_BACKEND }}:ci-${{ github.run_id }}
 
+      # IMPORTANT: use context="." and file="react/Dockerfile" (path from repo root)
       - name: Build frontend image
         uses: docker/build-push-action@v6
         with:
-          context: react
-          file: Dockerfile            # relative to the 'react' context
+          context: .
+          file: react/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.IMAGE_FRONTEND }}:ci-${{ github.run_id }}
