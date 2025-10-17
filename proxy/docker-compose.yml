@@ -1,0 +1,10 @@
+name: myproject-proxy
+services:
+  proxy:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/site.conf:/etc/nginx/conf.d/site.conf:ro
+      - ./nginx/upstreams:/etc/nginx/upstreams:ro
+    restart: unless-stopped
