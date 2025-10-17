@@ -1,13 +1,13 @@
-name: Deploy — Production
+name: Deploy — Production (Self-hosted, Tag-gated)
 
 on:
   push:
     tags:
-      - 'rel-*'   # push a rel-YYYY.MM.DD.N tag to trigger
+      - 'rel-*'
 
 jobs:
   build-and-deploy-prod:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, lan]
     environment: production
     env:
       IMAGE_FRONTEND: ghcr.io/gdragos79/myprojectappprod-frontend
@@ -30,7 +30,7 @@ jobs:
       - name: Build & push images (release + sha + latest)
         run: |
           SHORT_SHA=${GITHUB_SHA::7}
-          TAG="${GITHUB_REF_NAME}"   # the rel-YYYY.MM.DD.N tag
+          TAG="${GITHUB_REF_NAME}"
           docker build -t $IMAGE_BACKEND:$TAG -t $IMAGE_BACKEND:sha-$SHORT_SHA -t $IMAGE_BACKEND:latest ./backend
           docker build -t $IMAGE_FRONTEND:$TAG -t $IMAGE_FRONTEND:sha-$SHORT_SHA -t $IMAGE_FRONTEND:latest ./react
           docker push $IMAGE_BACKEND:$TAG
