@@ -1,0 +1,239 @@
+#######################################################################
+How to install
+######################################################################
+Option A — Install PostgreSQL natively (simple + reliable)
+
+Install server + client
+
+sudo apt-get update
+sudo apt-get install -y postgresql postgresql-contrib
+
+
+Verify and locate configs
+
+sudo -u postgres psql -tAc "SELECT version();"
+sudo -u postgres psql -tAc "SHOW config_file;"           #If it is successful it returns etc/postgresql/16/main/postgresql.conf
+sudo -u postgres psql -tAc "SHOW hba_file;"
+sudo -u postgres psql -tAc "SHOW listen_addresses;"
+
+
+Listen on LAN + allow Blue/Green
+
+CONF="$(sudo -u postgres psql -tAc "SHOW config_file;")"
+HBA="$(sudo -u postgres psql -tAc "SHOW hba_file;")"
+
+# Listen on all (or set your LAN IP)
+sudo sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" "$CONF"
+
+# Permit only the two App VMs (replace IPs!)
+printf '%s\n' \
+"host all all 192.168.1.21/32 scram-sha-256" \
+"host all all 192.168.1.22/32 scram-sha-256" \
+| sudo tee -a "$HBA"
+
+
+Restart & check port
+
+sudo systemctl restart postgresql
+sudo ss -ltnp | grep ':5432'   # expect 0.0.0.0:5432 or your LAN IP:5432
+
+
+Create app DB/user (example)
+
+sudo -u postgres psql -c "CREATE USER myapp WITH PASSWORD 'StrongPasswordHere';"
+sudo -u postgres psql -c "CREATE DATABASE mydb OWNER myapp;"
+
+
+(Optional) UFW allow from Blue/Green only
+
+sudo ufw allow from 192.168.1.21 to any port 5432 proto tcp
+sudo ufw allow from 192.168.1.22 to any port 5432 proto tcp
+
+
+Use these secrets in GitHub/VM env:
+
+DB_HOST=192.168.1.<db-vm-ip>
+DB_PORT=5432
+DB_USER=myapp
+DB_PASSWORD=StrongPasswordHere
+DB_NAME=mydb
+
+Option B — Run PostgreSQL in Docker (if you prefer containers)
+
+Create a small stack on the DB VM (adjust paths/IPs/password):
+
+mkdir -p ~/db/conf ~/db/data
+cat > ~/db/conf/postgresql.conf <<'CFG'
+listen_addresses = '*'
+hba_file = '/etc/postgresql/pg_hba.conf'
+CFG
+
+cat > ~/db/conf/pg_hba.conf <<'HBA'
+host all all 192.168.1.21/32 scram-sha-256
+host all all 192.168.1.22/32 scram-sha-256
+HBA
+
+cat > ~/db/docker-compose.yml <<'YAML'
+services:
+  postgres:
+    image: postgres:16
+    container_name: myproject-postgres
+    restart: unless-stopped
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: myapp
+      POSTGRES_PASSWORD: StrongPasswordHere
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./conf/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./conf/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    command: ["postgres","-c","config_file=/etc/postgresql/postgresql.conf"]
+YAML
+
+
+Start & verify
+
+cd ~/db
+docker compose up -d
+docker ps
+sudo ss -ltnp | grep ':5432'
+
+
+(Optional) UFW allow from Blue/Green only
+
+sudo ufw allow from 192.168.1.21 to any port 5432 proto tcp
+sudo ufw allow from 192.168.1.22 to any port 5432 proto tcp
+
+
+Use the same DB secrets as above (DB_HOST = DB VM’s LAN IP).
+
+Which should you choose?
+
+Option A (native) is simplest and matches most guides.
+
+Option B (Docker) is fine if you’re standardizing on containers; just keep the volume directory safe for backups.
+
+Once either option is running, you can test from Blue/Green:
+
+pg_isready -h 192.168.1.<db-vm-ip> -p 5432 -U myapp
+PGPASSWORD='StrongPasswordHere' psql "postgresql://myapp@192.168.1.<db-vm-ip>:5432/mydb?connect_timeout=5" -c "SELECT 1;"
+############################################################################
+How to check
+##############################################################################
+#Veryfy the installation
+1) Confirm where the config files are
+# On the DB VM
+sudo -u postgres psql -tAc "SHOW config_file;"
+sudo -u postgres psql -tAc "SHOW hba_file;"
+sudo -u postgres psql -tAc "SHOW listen_addresses;"
+sudo -u postgres psql -tAc "SHOW port;"
+
+
+Typical locations:
+
+Ubuntu/Debian: /etc/postgresql/<version>/main/postgresql.conf and .../pg_hba.conf
+
+RHEL/CentOS: /var/lib/pgsql/<version>/data/postgresql.conf and .../pg_hba.conf
+
+Also check the socket is listening on the LAN:
+
+sudo ss -ltnp | grep ':5432' || echo "nothing on 5432 yet"
+
+
+You want to see 0.0.0.0:5432 or your LAN IP 192.168.1.xx:5432 – not just 127.0.0.1:5432.
+
+2) Set listen_addresses
+
+Edit the postgresql.conf from step 1:
+
+sudo nano "$(sudo -u postgres psql -tAc "SHOW config_file;")"
+
+
+Find and set:
+
+listen_addresses = '*'
+# (or set a specific LAN IP, e.g. listen_addresses = '192.168.1.50')
+
+
+Changing listen_addresses requires a restart (not just reload).
+
+3) Allow Blue & Green in pg_hba.conf
+
+Edit the file from step 1:
+
+sudo nano "$(sudo -u postgres psql -tAc "SHOW hba_file;")"
+
+
+Add these lines near the top (before any broader rules), replacing IPs with your App VMs’ LAN IPs:
+
+# Allow App VMs
+host    all     all     192.168.1.21/32    scram-sha-256
+host    all     all     192.168.1.22/32    scram-sha-256
+
+
+If your server is older and uses md5 auth, you can use md5 instead.
+
+/32 locks it to that exact host. If you prefer a small subnet (e.g., .0/24), you can, but /32 is tighter.
+
+pg_hba.conf is first-match-wins top-to-bottom. Keep your allow rules above any broad rejects or “all” rules.
+
+4) Reload / restart Postgres
+# Reload is enough for pg_hba changes
+sudo systemctl reload postgresql || sudo systemctl reload postgresql@<version>-main
+
+# Restart is required if you changed listen_addresses
+sudo systemctl restart postgresql || sudo systemctl restart postgresql@<version>-main
+
+# Verify it’s listening on LAN now
+sudo ss -ltnp | grep ':5432'
+
+5) (Optional) Firewall on the DB VM
+
+If UFW is enabled, allow only Blue & Green to port 5432:
+
+sudo ufw allow from 192.168.1.21 to any port 5432 proto tcp
+sudo ufw allow from 192.168.1.22 to any port 5432 proto tcp
+# (Optionally remove any wider 5432 rule)
+sudo ufw status numbered
+
+6) Test from the App VMs (Blue & Green)
+
+From Blue:
+
+pg_isready -h 192.168.1.50 -p 5432 -U <DB_USER>     # replace DB IP and user
+# If you have psql:
+PGPASSWORD='<DB_PASSWORD>' \
+psql "postgresql://<DB_USER>@192.168.1.50:5432/<DB_NAME>?connect_timeout=5" -c "SELECT 1;"
+
+
+From Green: same commands.
+
+If these succeed, your Prisma/Docker containers will also connect (they use the same host/port).
+
+7) Sanity checks (optional but useful)
+# Show effective settings (from the server)
+sudo -u postgres psql -tAc "SHOW listen_addresses;"
+sudo -u postgres psql -tAc "SHOW ssl;"                # FYI; you can keep it off on LAN for now
+sudo -u postgres psql -tAc "SELECT inet_server_addr(), inet_server_port();"
+
+
+If you still can’t connect from Blue/Green:
+
+Re-check pg_hba.conf ordering.
+
+Ensure your DB user/password/database are correct and exist:
+
+sudo -u postgres psql -c "DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '<DB_USER>') THEN
+    CREATE USER <DB_USER> WITH PASSWORD '<DB_PASSWORD>';
+  END IF;
+END $$;"
+
+sudo -u postgres psql -c "SELECT 1 FROM pg_database WHERE datname = '<DB_NAME>';" \
+  || sudo -u postgres createdb -O <DB_USER> <DB_NAME>
+
+
+Verify no external firewall or router blocks LAN traffic.
+
+TL;DR checklist

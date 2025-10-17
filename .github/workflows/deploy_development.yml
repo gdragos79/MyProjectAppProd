@@ -6,7 +6,7 @@ on:
 
 jobs:
   build-test-deploy-green:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, lan]
     env:
       IMAGE_FRONTEND: ghcr.io/gdragos79/myprojectappprod-frontend
       IMAGE_BACKEND: ghcr.io/gdragos79/myprojectappprod-backend
@@ -14,7 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Tests first (fail early) ---
       - name: Backend CI
         run: |
           npm -C backend ci
@@ -30,7 +29,6 @@ jobs:
         id: meta
         run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
-      # --- Build & push images if tests passed ---
       - name: Log in to GHCR
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
 
@@ -41,7 +39,6 @@ jobs:
           docker push $IMAGE_BACKEND:sha-${{ steps.meta.outputs.short_sha }}
           docker push $IMAGE_FRONTEND:sha-${{ steps.meta.outputs.short_sha }}
 
-      # --- Always deploy to GREEN only; no proxy flip here ---
       - name: Deploy to GREEN App VM (staging area)
         uses: appleboy/ssh-action@v1.2.0
         with:

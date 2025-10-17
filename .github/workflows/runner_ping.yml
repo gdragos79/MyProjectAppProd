@@ -1,21 +1,11 @@
-name: Runner ping
-on: workflow_dispatch
+name: Runner health ping (LAN)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
 
 jobs:
-  ping_blue:
-    runs-on: [self-hosted, linux, app-blue]
+  ping:
+    runs-on: [self-hosted, linux, lan]
     steps:
-      - run: |
-          whoami
-          uname -a
-          docker --version
-          docker compose version
-
-  ping_green:
-    runs-on: [self-hosted, linux, app-green]
-    steps:
-      - run: |
-          whoami
-          uname -a
-          docker --version
-          docker compose version
+      - run: echo "Runner OK at $(date)"
