@@ -1,0 +1,14 @@
+// --- /healthz endpoint (drop-in snippet) ---
+// Assumes you have: const express = require('express'); const app = express();
+// Optional: if you have 'client' from 'pg', this will LIGHTLY ping DB; otherwise comment it out.
+app.get('/healthz', async (req, res) => {
+  try {
+    if (typeof client?.query === 'function') {
+      await client.query('SELECT 1');
+    }
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('Health check failed:', err?.message || err);
+    res.status(500).json({ status: 'error', error: String(err?.message || err) });
+  }
+});

@@ -1,0 +1,6 @@
+{
+  "scripts": {
+    "prisma:generate": "prisma generate",
+    "migrate": "prisma migrate deploy"
+  }
+}
