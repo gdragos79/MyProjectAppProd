@@ -59,8 +59,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Debug tree & verify Dockerfiles
+        run: |
+          echo "HEAD=$(git rev-parse --short HEAD)"
+          ls -la
+          ls -la backend || true
+          ls -la react   || true
+          test -f backend/Dockerfile || (echo "::error:: missing backend/Dockerfile"; exit 1)
+          test -f react/Dockerfile   || (echo "::error:: missing react/Dockerfile"; exit 1)
+
       - name: Login to GHCR (skip on PR)
-      # we only push on push/workflow_dispatch; PRs build but don't push
         if: ${{ github.event_name != 'pull_request' }}
         uses: docker/login-action@v3
         with:
@@ -72,7 +80,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: backend
-          file: backend/Dockerfile
+          file: Dockerfile            # relative to the 'backend' context
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.IMAGE_BACKEND }}:ci-${{ github.run_id }}
 
@@ -80,6 +88,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: react
-          file: react/Dockerfile
+          file: Dockerfile            # relative to the 'react' context
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.IMAGE_FRONTEND }}:ci-${{ github.run_id }}
