@@ -105,7 +105,7 @@ sudo mkdir -p /var/lib/myproject
 echo "blue" | sudo tee /var/lib/myproject/live_color
 ```
 
-### 2.3. (Optional) Autostart via systemd
+### 2.3. (MUST!!!Dependent on 3.2) Autostart via systemd
 Copy `systemd/myproject-proxy.service` to `/etc/systemd/system/` on the Proxy VM, then:
 ```bash
 sudo systemctl daemon-reload
@@ -124,7 +124,7 @@ This compose expects the following environment variables at runtime:
 - `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
 - It publishes frontend on **port 80** and backend on **port 3000**.
 
-### 3.2. (Optional) Autostart via systemd (Tricky!!!!See Autostart vis systemd for a detailed description related also to the security!!)
+### 3.2. Autostart via systemd (Tricky!!!!See Autostart vis systemd for a detailed description related also to the security!!)
 Copy `systemd/myproject-app.service` to `/etc/systemd/system/` on each App VM:
 ```bash
 sudo mkdir -p /etc/myproject
