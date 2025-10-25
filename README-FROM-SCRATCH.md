@@ -63,56 +63,12 @@ docker compose version
 ---
 
 ## 2) Prepare the Proxy VM
-
-### 2.1. Copy the proxy files
-Copy the `proxy/` folder from this bundle to `/home/gdragos/proxy/` on the **Proxy VM**.
-
-File layout:
-```
-/home/gdragos/proxy/
-  docker-compose.yml
-  nginx/
-    site.conf
-    upstreams/
-      active.conf        # <- symlink to ../upstream-blue.conf or ../upstream-green.conf
-    upstream-blue.conf   # <- edit BLUE_VM_IP placeholder
-    upstream-green.conf  # <- edit GREEN_VM_IP placeholder
-```
-
-Edit **`nginx/upstream-blue.conf`** and **`nginx/upstream-green.conf`** and set LAN IPs:
-```nginx
-# upstream-blue.conf
-upstream app_upstream { server 192.168.1.21:80; keepalive 32; }  # Blue VM IP
-
-# upstream-green.conf
-upstream app_upstream { server 192.168.1.22:80; keepalive 32; }  # Green VM IP
-```
-
-Create the active symlink and start:
-```bash
-cd /home/gdragos/proxy/nginx/upstreams
-ln -sfn ../upstream-blue.conf active.conf   # default live = blue
-cd /home/gdragos/proxy
-docker compose up -d
-```
-
-> The CI/CD will flip by switching `active.conf` to the other file and reloading NGINX.
-
-### 2.2. Persist live color state (for CI/CD)
-Create a state file on the Proxy VM:
-```bash
-sudo mkdir -p /var/lib/myproject
-echo "blue" | sudo tee /var/lib/myproject/live_color
-```
-
+Follow the instructions from ProxyVMSetup_NativeProxyMachine_Final from the /proxy folder
 ### 2.3. (MUST!!!Dependent on 3.2) Autostart via systemd
 Copy `systemd/myproject-proxy.service` to `/etc/systemd/system/` on the Proxy VM, then:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now myproject-proxy
-```
-
----
 
 ## 3) Prepare each App VM (Blue and Green)
 
