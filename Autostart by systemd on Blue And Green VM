@@ -1,4 +1,4 @@
-Prerequisites (one time per machine)
+### Prerequisites (one time per machine)
 0) Check systemd + docker compose
 systemd --version     # systemd ≥ 249 is ideal (Ubuntu 22.04/24.04 OK)
 docker compose version
