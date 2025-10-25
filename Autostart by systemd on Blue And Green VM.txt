@@ -141,6 +141,7 @@ exec docker compose --env-file "$tmp" -f /home/gdragos/app/docker-compose.yml "$
 SH
 sudo chmod +x /usr/local/bin/myapp-compose
 
+cd /home/gdragos/app/
 
 Now run:
 
