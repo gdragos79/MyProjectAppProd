@@ -58,6 +58,29 @@ DB_USER=myapp
 DB_PASSWORD=StrongPasswordHere
 DB_NAME=mydb
 
+#Check if the connection from to DB is working (execute on the machine which needs to establish a connection to the DB):
+#Install client tools (once)
+sudo apt update
+sudo apt install -y postgresql-client
+#Quick TCP reachability (firewall/port open)
+#replace with your DB VM IP / DNS
+DB_HOST=192.168.238.137
+nc -vz $DB_HOST 5432        # or: nc -zv $DB_HOST 5432
+#Succeeded → TCP path is open.
+#Timeout/Refused → firewall/port/listen issue on the DB VM.
+#Is PostgreSQL accepting connections (no auth yet)?
+pg_isready -h $DB_HOST -p 5432
+#Returns “accepting connections” with exit code 0 if OK.
+#Full login test (auth + DB selected)
+DB_HOST=192.168.238.137
+DB_PORT=5432
+DB_USER=myapp_stg
+DB_NAME=myapp_staging
+read -s -p "DB password: " PGPASSWORD; echo PGPASSWORD="$PGPASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "select version();"
+#You should see a PostgreSQL version row (exit code 0).
+   #or execute the one liner:
+psql "postgresql://myapp_stg:YOUR_PASS@$DB_HOST:5432/myapp_staging?sslmode=prefer" -c "select 1;"
+
 Option B — Run PostgreSQL in Docker (if you prefer containers)
 
 Create a small stack on the DB VM (adjust paths/IPs/password):
