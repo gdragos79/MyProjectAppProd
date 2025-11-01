@@ -99,12 +99,10 @@ jobs:
   pick_target:
     if: github.ref_name == 'restructure/monorepo'
     needs: resolve_image
-    runs-on:
-      labels: [self-hosted, proxy]
+    runs-on: [self-hosted, proxy]
     outputs:
       active_color: ${{ steps.pick.outputs.active_color }}
       target_color: ${{ steps.pick.outputs.target_color }}
-      target_label: ${{ steps.pick.outputs.target_label }}
     steps:
       - name: Detect active color (proxy)
         id: pick
@@ -137,13 +135,109 @@ jobs:
 
           echo "active_color=$ACTIVE" >> "$GITHUB_OUTPUT"
           echo "target_color=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "target_label=$TARGET" >> "$GITHUB_OUTPUT"
 
-  deploy_to_target:
-    if: github.ref_name == 'restructure/monorepo'
+  # ----- Deploy to BLUE (only if target_color == 'blue') -----
+  deploy_blue:
+    if: github.ref_name == 'restructure/monorepo' && needs.pick_target.outputs.target_color == 'blue'
     needs: [resolve_image, pick_target]
-    runs-on:
-      labels: [self-hosted, ${{ needs.pick_target.outputs.target_label }}]
+    runs-on: [self-hosted, blue]
+    environment: Production
+    steps:
+      - name: Show runner info
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner: $(hostname) / $(uname -a)"
+          docker --version || true
+          which docker || true
+          which curl || (sudo apt-get update -y && sudo apt-get install -y curl)
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.resolve_image.outputs.IMAGE_PULL }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+
+      - name: Free host port ${{ env.PROD_PORT }} if used
+        shell: bash
+        run: |
+          set -euo pipefail
+          CIDS=$(docker ps -q --filter "publish=${{ env.PROD_PORT }}")
+          if [ -n "$CIDS" ]; then
+            echo "Port ${{ env.PROD_PORT }} is in use by container(s): $CIDS — stopping…"
+            docker rm -f $CIDS || true
+          fi
+          if ss -ltnp | grep -q ":${{ env.PROD_PORT }} "; then
+            echo "❌ Port ${{ env.PROD_PORT }} still busy (non-Docker process):"
+            ss -ltnp | grep ":${{ env.PROD_PORT }} " || true
+            exit 1
+          fi
+
+      - name: Remove old prod containers (optional cleanup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLD=$(docker ps -a --filter "name=^prodContainer_" -q)
+          if [ -n "$OLD" ]; then
+            echo "Removing old prod containers: $OLD"
+            docker rm -f $OLD || true
+          fi
+
+      - name: Run new container (host ${{ env.PROD_PORT }} -> container 3000)
+        shell: bash
+        env:
+          IMAGE:   ${{ needs.resolve_image.outputs.IMAGE_PULL }}
+          BASE:    ${{ needs.resolve_image.outputs.BASE_TAG }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: |
+          set -euo pipefail
+          NAME="prodContainer_${BASE}"
+          docker run -d --name "$NAME" \
+            --label app=prod-backend \
+            -e DB_HOST="$DB_HOST" \
+            -e DB_PORT="$DB_PORT" \
+            -e DB_USER="$DB_USER" \
+            -e DB_PASSWORD="$DB_PASS" \
+            -e DB_NAME="$DB_NAME" \
+            -e PORT="3000" \
+            -p ${PROD_PORT}:3000 \
+            "$IMAGE"
+          echo "Started: $NAME"
+          docker ps --filter "name=$NAME"
+
+      - name: Local health check on target VM (pre-flip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..120}; do
+            if curl -fsS "http://127.0.0.1:${PROD_PORT}/api/health" >/dev/null 2>&1; then
+              echo "✅ Target VM backend healthy (pre-flip)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "❌ Target VM backend did not become healthy before flip."
+          docker logs --tail=200 $(docker ps -q --filter "label=app=prod-backend") || true
+          exit 1
+
+  # ----- Deploy to GREEN (only if target_color == 'green') -----
+  deploy_green:
+    if: github.ref_name == 'restructure/monorepo' && needs.pick_target.outputs.target_color == 'green'
+    needs: [resolve_image, pick_target]
+    runs-on: [self-hosted, green]
     environment: Production
     steps:
       - name: Show runner info
@@ -237,10 +331,12 @@ jobs:
           exit 1
 
   flip_proxy_and_soak:
-    if: github.ref_name == 'restructure/monorepo'
-    needs: [resolve_image, pick_target, deploy_to_target]
-    runs-on:
-      labels: [self-hosted, proxy]
+    # proceed only if either deploy job succeeded
+    if: >
+      github.ref_name == 'restructure/monorepo' &&
+      (needs.deploy_blue.result == 'success' || needs.deploy_green.result == 'success')
+    needs: [resolve_image, pick_target, deploy_blue, deploy_green]
+    runs-on: [self-hosted, proxy]
     environment: Production
     steps:
       - name: Flip active.conf to target color and reload Nginx
