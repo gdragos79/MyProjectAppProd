@@ -14,9 +14,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # 👇 Choose ONE and keep consistent with Production
+  # 👇 Keep this consistent with Production
   PKG_NAME: myprojectapp-backend
-  # PKG_NAME: myprojectappprod-backend
   APP_DIR: apps/backend
   STAGING_PORT_HOST: "3001"   # host port on Staging VM
   CONTAINER_PORT: "3000"      # app listens inside container
@@ -34,17 +33,14 @@ jobs:
 
       - name: Compute tags
         id: meta
+        shell: bash
         run: |
           set -euo pipefail
           OWNER="${GITHUB_REPOSITORY%/*}"
-          REPO="${GITHUB_REPOSITORY#*/}"
           OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
-          REPO_LC=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
-
           BASE="${{ inputs.BASE_TAG }}"
           IMAGE_BASE="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:${BASE}"
           IMAGE_PC="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:prod-candidate_${BASE}"
-
           echo "IMAGE_BASE=$IMAGE_BASE" >> "$GITHUB_OUTPUT"
           echo "IMAGE_PC=$IMAGE_PC"     >> "$GITHUB_OUTPUT"
           echo "Base tag: $IMAGE_BASE"
@@ -57,11 +53,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ✅ Force a docker-container builder so GHA cache works
+      - name: Set up Buildx (docker-container)
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+          driver: docker-container
+          install: true
+
       - name: Build & push both tags
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile      # adjust if your Dockerfile lives elsewhere
+          file: ./Dockerfile      # change if your Dockerfile is elsewhere
           push: true
           build-args: |
             NODE_ENV=production
@@ -71,6 +75,7 @@ jobs:
             ${{ env.REGISTRY }}/gdragos79/${{ env.PKG_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false  # optional: avoids attestation noise
 
   deploy_staging:
     needs: build_and_push
@@ -78,26 +83,34 @@ jobs:
     environment: Staging
     steps:
       - name: Show runner info
+        shell: bash
         run: |
           set -euo pipefail
           echo "Runner: $(hostname)"
           docker --version || true
 
       - name: Pull the prod-candidate image
+        shell: bash
         env:
           IMAGE_PC: ${{ needs.build_and_push.outputs.IMAGE_PC }}
         run: |
           set -euo pipefail
           docker pull "$IMAGE_PC"
 
-      - name: Stop & remove any prior container on port ${{ env.STAGING_PORT_HOST }}
+      - name: Stop & remove any container using port ${{ env.STAGING_PORT_HOST }}
+        shell: bash
         run: |
           set -euo pipefail
-          # Remove containers publishing the staging host port
           CIDS=$(docker ps -q --filter "publish=${{ env.STAGING_PORT_HOST }}")
           if [ -n "$CIDS" ]; then docker rm -f $CIDS || true; fi
+          if ss -ltnp | grep -q ":${{ env.STAGING_PORT_HOST }} "; then
+            echo "❌ Port ${{ env.STAGING_PORT_HOST }} is used by a non-Docker process:"
+            ss -ltnp | grep ":${{ env.STAGING_PORT_HOST }} " || true
+            exit 1
+          fi
 
       - name: Run new staging container
+        shell: bash
         env:
           IMAGE_PC: ${{ needs.build_and_push.outputs.IMAGE_PC }}
           DB_HOST: ${{ secrets.DB_HOST_STAGING }}
@@ -121,6 +134,7 @@ jobs:
           docker ps --filter "name=$NAME"
 
       - name: Health check on Staging VM
+        shell: bash
         run: |
           set -euo pipefail
           for i in {1..60}; do
