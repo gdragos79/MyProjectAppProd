@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       IMAGE_TAG_BASE:
-        description: "Base tag from Staging (e.g. 01_11_2025_v0.9). Prod tries prod-candidate_<tag> first, then <tag>."
+        description: "Base tag from Staging (e.g. 01_11_2025_v0.9). Tries prod-candidate_<tag> first, then <tag>."
         type: string
         required: true
       TARGET_OVERRIDE:
@@ -27,10 +27,10 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  PKG_NAME: myprojectapp-backend        # image name used by Staging SBX
+  PKG_NAME: myprojectapp-backend         # must match the Staging push image name
   PROD_PORT: "3000"
 
-  # Proxy symlink + upstreams (you confirmed these)
+  # Proxy symlink + upstreams
   ACTIVE_LINK: "/etc/nginx/upstreams/active.conf"
   BLUE_CONF:  "/etc/nginx/upstreams-available/upstream-blue.conf"
   GREEN_CONF: "/etc/nginx/upstreams-available/upstream-green.conf"
@@ -93,7 +93,9 @@ jobs:
 
   pick_target:
     needs: resolve_image
-    runs-on: [self-hosted, proxy]
+    runs-on:
+      - self-hosted
+      - proxy
     outputs:
       active_color: ${{ steps.pick.outputs.active_color }}
       target_color: ${{ steps.pick.outputs.target_color }}
@@ -132,7 +134,9 @@ jobs:
 
   deploy_to_target:
     needs: [resolve_image, pick_target]
-    runs-on: [self-hosted, ${{ needs.pick_target.outputs.target_label }}]
+    runs-on:
+      - self-hosted
+      - ${{ needs.pick_target.outputs.target_label }}
     environment: Production
     steps:
       - name: Info
@@ -160,16 +164,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # stop containers publishing ${PROD_PORT}
           CIDS=$(docker ps -q --filter "publish=${PROD_PORT}")
           if [ -n "$CIDS" ]; then
             echo "Stopping containers using port ${PROD_PORT}: $CIDS"
             docker rm -f $CIDS || true
           fi
+          # remove any older prod containers by label
           OLD=$(docker ps -a -q --filter "label=app=prod-backend")
           if [ -n "$OLD" ]; then
             echo "Removing old prod containers: $OLD"
             docker rm -f $OLD || true
           fi
+          # ensure port is free
           if ss -ltnp | grep -q ":${PROD_PORT} "; then
             echo "❌ Port ${PROD_PORT} still busy by non-Docker process:"
             ss -ltnp | grep ":${PROD_PORT} " || true
@@ -218,7 +225,9 @@ jobs:
 
   flip_proxy_and_soak:
     needs: [resolve_image, pick_target, deploy_to_target]
-    runs-on: [self-hosted, proxy]
+    runs-on:
+      - self-hosted
+      - proxy
     environment: Production
     steps:
       - name: Flip proxy symlink and reload Nginx
@@ -228,12 +237,11 @@ jobs:
           TARGET: ${{ needs.pick_target.outputs.target_color }}
         run: |
           set -euo pipefail
-
           ACTIVE_LINK="${{ env.ACTIVE_LINK }}"
           BLUE_CONF="${{ env.BLUE_CONF }}"
           GREEN_CONF="${{ env.GREEN_CONF }}"
 
-          # Detect binaries (fall back to common paths)
+          # Detect binaries (fallbacks included)
           LN_BIN="$(command -v ln || echo /usr/bin/ln)"
           NGINX_BIN="$(command -v nginx || echo /usr/sbin/nginx)"
           SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
