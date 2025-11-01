@@ -113,11 +113,11 @@ umask 077
 
 cat > "$tmpfile" <<'ENV'
 TAG=latest
-DB_HOST=192.168.238.137
-DB_PORT=5432
-DB_USER=deploy
-DB_PASSWORD=password1234
-DB_NAME=myappstagingdb
+DB_HOST_STAGING=192.168.XXX.XXX
+DB_PORT_STAGING=5432
+DB_USER_STAGING=deploy
+DB_PASSWORD_STAGING=your password
+DB_NAME_STAGING=your db name
 VITE_API_BASE_URL=/api
 ENV
 
@@ -319,4 +319,5 @@ journalctl -xeu myproject-app -n 50 --no-pager
 ```
 
 and I’ll pinpoint the exact tweak.
+
 
