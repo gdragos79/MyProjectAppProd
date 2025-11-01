@@ -5,7 +5,7 @@ on:
 
 permissions:
   contents: read
-  packages: write  # needed to push to GHCR from the runner
+  packages: write  # push to GHCR from the runner
 
 env:
   APP_DIR: apps/backend
@@ -28,16 +28,18 @@ jobs:
       - name: Compute image names and tag
         id: meta
         shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NO: ${{ github.run_number }}
+          OWNER: ${{ github.repository_owner }}
+          REPO:  ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
           DATE=$(date +%d_%m_%Y)
-          # Version increases by 0.1 every run of THIS workflow
-          VRAW=$(awk -v n="$GITHUB_RUN_NUMBER" 'BEGIN{printf "%.1f", n/10}')
+          VRAW=$(awk -v n="$RUN_NO" 'BEGIN{printf "%.1f", n/10}')
           VERSION="v${VRAW}"
-          BRANCH_SAFE="${GITHUB_REF_NAME//\//-}"
+          BRANCH_SAFE="${REF_NAME//\//-}"
 
-          OWNER="${GITHUB_REPOSITORY%/*}"
-          REPO="${GITHUB_REPOSITORY#*/}"
           OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
           REPO_LC=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
 
@@ -45,9 +47,11 @@ jobs:
           IMAGE_B="${REGISTRY}/${OWNER_LC}/${REPO_LC}-backend:${TAG}"
           IMAGE_B_PROD="${REGISTRY}/${OWNER_LC}/${REPO_LC}-backend:prod-candidate_${TAG}"
 
-          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_B=$IMAGE_B" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_B_PROD=$IMAGE_B_PROD" >> "$GITHUB_OUTPUT"
+          {
+            echo "TAG=$TAG"
+            echo "IMAGE_B=$IMAGE_B"
+            echo "IMAGE_B_PROD=$IMAGE_B_PROD"
+          } >> "$GITHUB_OUTPUT"
 
           echo "Computed:"
           echo "  TAG=$TAG"
@@ -59,7 +63,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ github.token }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & Push backend image
         working-directory: ${{ env.APP_DIR }}
@@ -105,81 +109,86 @@ jobs:
 
       - name: Deploy backend container on staging VM (port 3001)
         shell: bash
+        env:
+          # SSH
+          HOST: ${{ secrets.STAGING_SSH_HOST }}
+          USER: ${{ secrets.STAGING_SSH_USER }}
+
+          # Image info
+          IMAGE_B: ${{ needs.build_and_push.outputs.IMAGE_B }}
+          TAG:     ${{ needs.build_and_push.outputs.TAG }}
+
+          # DB secrets (staging)
+          DB_HOST: ${{ secrets.DB_HOST_STAGING }}
+          DB_PORT: ${{ secrets.DB_PORT_STAGING }}
+          DB_USER: ${{ secrets.DB_USER_STAGING }}
+          DB_PASS: ${{ secrets.DB_PASSWORD_STAGING }}
+          DB_NAME: ${{ secrets.DB_NAME_STAGING }}
+
+          # GHCR pull credentials on the REMOTE VM
+          # Provide at least one of these in the Staging environment:
+          #   STAGING_GHCR_PAT (preferred), optionally STAGING_GHCR_USER
+          # or GHCR_PAT (falls back to github.actor as user)
+          STAGING_GHCR_USER: ${{ secrets.STAGING_GHCR_USER }}
+          STAGING_GHCR_PAT:  ${{ secrets.STAGING_GHCR_PAT }}
+          GHCR_PAT:          ${{ secrets.GHCR_PAT }}
+          ACTOR:             ${{ github.actor }}
         run: |
           set -euo pipefail
 
-          # Resolve GHCR pull credentials for the REMOTE VM
-          CR_USER="${{ secrets.STAGING_GHCR_USER }}"
-          if [ -z "$CR_USER" ]; then CR_USER="${{ github.actor }}"; fi
+          # choose creds: prefer STAGING_GHCR_* then GHCR_PAT (with runner actor)
+          CR_USER="$STAGING_GHCR_USER"
+          [ -n "$CR_USER" ] || CR_USER="$ACTOR"
 
-          CR_PAT="${{ secrets.STAGING_GHCR_PAT }}"
-          if [ -z "$CR_PAT" ]; then CR_PAT="${{ secrets.GHCR_PAT }}"; fi
+          CR_PAT="$STAGING_GHCR_PAT"
+          [ -n "$CR_PAT" ] || CR_PAT="$GHCR_PAT"
+
           if [ -z "$CR_PAT" ]; then
             echo "Missing GHCR token for REMOTE VM: add STAGING_GHCR_PAT (preferred) or GHCR_PAT in Staging env." >&2
             exit 1
           fi
 
-          # Convenience locals
-          HOST="${{ secrets.STAGING_SSH_HOST }}"
-          USER="${{ secrets.STAGING_SSH_USER }}"
-          IMAGE_B="${{ needs.build_and_push.outputs.IMAGE_B }}"
-          TAG="${{ needs.build_and_push.outputs.TAG }}"
-
-          # DB secrets (staging)
-          DB_HOST="${{ secrets.DB_HOST_STAGING }}"
-          DB_PORT="${{ secrets.DB_PORT_STAGING }}"
-          DB_USER="${{ secrets.DB_USER_STAGING }}"
-          DB_PASS="${{ secrets.DB_PASSWORD_STAGING }}"
-          DB_NAME="${{ secrets.DB_NAME_STAGING }}"
-
           echo "Connecting to ${USER}@${HOST} …"
-          ssh -i ~/.ssh/id_ed25519 "${USER}@${HOST}" bash -se <<EOF
-          set -euo pipefail
+          # Pass variables to the remote shell without heredocs (YAML-safe)
+          ssh -o StrictHostKeyChecking=yes -i ~/.ssh/id_ed25519 "${USER}@${HOST}" \
+          "CR_USER='$CR_USER' CR_PAT='$CR_PAT' IMAGE_B='$IMAGE_B' TAG='$TAG' \
+           DB_HOST='$DB_HOST' DB_PORT='$DB_PORT' DB_USER='$DB_USER' DB_PASS='$DB_PASS' DB_NAME='$DB_NAME' \
+           bash -se -c '
+set -euo pipefail
+echo \"Docker login to GHCR on remote…\"
+echo \"\$CR_PAT\" | docker login ghcr.io -u \"\$CR_USER\" --password-stdin
 
-          CR_USER="${CR_USER}"
-          CR_PAT="${CR_PAT}"
-          IMAGE_B="${IMAGE_B}"
-          TAG="${TAG}"
+echo \"Pull image: \$IMAGE_B\"
+docker pull \"\$IMAGE_B\"
 
-          DB_HOST="${DB_HOST}"
-          DB_PORT="${DB_PORT}"
-          DB_USER="${DB_USER}"
-          DB_PASS="${DB_PASS}"
-          DB_NAME="${DB_NAME}"
+NAME=\"stgContainer_\$TAG\"
 
-          echo "Docker login to GHCR on remote…"
-          echo "\$CR_PAT" | docker login ghcr.io -u "\$CR_USER" --password-stdin
+echo \"Stop/remove old container (if any)…\"
+docker rm -f \"\$NAME\" 2>/dev/null || true
 
-          echo "Pull image: \$IMAGE_B"
-          docker pull "\$IMAGE_B"
+echo \"Run new container on host port 3001 → container 3000…\"
+docker run -d --name \"\$NAME\" \
+  -e DB_HOST=\"\$DB_HOST\" \
+  -e DB_PORT=\"\$DB_PORT\" \
+  -e DB_USER=\"\$DB_USER\" \
+  -e DB_PASSWORD=\"\$DB_PASS\" \
+  -e DB_NAME=\"\$DB_NAME\" \
+  -e PORT=\"3000\" \
+  -p 3001:3000 \
+  \"\$IMAGE_B\"
 
-          NAME="stgContainer_\$TAG"
+echo \"Wait for /api/health on 127.0.0.1:3001 …\"
+for i in {1..60}; do
+  if curl -fsS \"http://127.0.0.1:3001/api/health\" >/dev/null 2>&1; then
+    echo \"✅ Staging health OK at /api/health (port 3001)\"
+    docker ps --filter \"name=\$NAME\"
+    exit 0
+  fi
+  sleep 2
+done
 
-          echo "Stop/remove old container (if any)…"
-          docker rm -f "\$NAME" 2>/dev/null || true
+echo \"❌ Staging health failed. Logs:\"
+docker logs --tail=200 \"\$NAME\" || true
+exit 1
+'"
 
-          echo "Run new container on host port 3001 → container 3000…"
-          docker run -d --name "\$NAME" \
-            -e DB_HOST="\$DB_HOST" \
-            -e DB_PORT="\$DB_PORT" \
-            -e DB_USER="\$DB_USER" \
-            -e DB_PASSWORD="\$DB_PASS" \
-            -e DB_NAME="\$DB_NAME" \
-            -e PORT="3000" \
-            -p 3001:3000 \
-            "\$IMAGE_B"
-
-          echo "Wait for /api/health on 127.0.0.1:3001 …"
-          for i in {1..60}; do
-            if curl -fsS "http://127.0.0.1:3001/api/health" >/dev/null 2>&1; then
-              echo "✅ Staging health OK at /api/health (port 3001)"
-              docker ps --filter "name=\$NAME"
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo "❌ Staging health failed. Logs:"
-          docker logs --tail=200 "\$NAME" || true
-          exit 1
-EOF
