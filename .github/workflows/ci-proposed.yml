@@ -1,0 +1,57 @@
+name: CI (sync dev with main, test, merge to main) [PROPOSED]
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    environment: Development
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: development
+          fetch-depth: 0
+
+      - name: Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge latest main into development
+        run: |
+          git fetch origin main
+          git checkout development
+          git merge --no-edit origin/main
+
+      - name: Backend - install deps
+        working-directory: apps/backend
+        run: npm ci
+
+      - name: Backend - tests
+        working-directory: apps/backend
+        env:
+          DB_HOST: ${{ secrets.DEV_DB_HOST }}
+          DB_PORT: ${{ secrets.DEV_DB_PORT }}
+          DB_USER: ${{ secrets.DEV_DB_USER }}
+          DB_PASSWORD: ${{ secrets.DEV_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DEV_DB_NAME }}
+        run: npm test -- --runInBand
+
+      - name: Frontend - install deps
+        working-directory: apps/frontend
+        run: npm ci
+
+      - name: Frontend - build
+        working-directory: apps/frontend
+        run: npm run build
+
+      - name: Merge development -> main
+        run: |
+          git checkout main
+          git merge --ff-only development || git merge --no-edit development
+          git push origin main
