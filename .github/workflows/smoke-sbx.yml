@@ -4,17 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       USE_SECRETS_DB:
-        description: "Use DB connection from GitHub Secrets instead of ephemeral Postgres"
+        description: "Use external DB from GitHub Secrets (checked) or ephemeral Postgres (unchecked)"
         type: boolean
         default: true
 
 permissions:
   contents: read
 
+# Run only when you trigger on the sandbox branch
+# (You can remove the 'if' checks below if you want to run on any branch.)
 jobs:
-  # --------------------------
-  # Job A: uses DB from SECRETS (external DB)
-  # --------------------------
+  # ------------------------------------------------------------
+  # Job A: Use an EXTERNAL DB defined in GitHub Secrets
+  # ------------------------------------------------------------
   smoke_secrets:
     if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB == true
     name: Smoke (Secrets DB)
@@ -38,12 +40,29 @@ jobs:
             exit 1
           fi
 
-      - name: Set up Node.js 20
+      - name: Detect backend lockfile
+        id: lock_backend
+        shell: bash
+        run: |
+          if [ -f "apps/backend/package-lock.json" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js 20 (with npm cache)
+        if: steps.lock_backend.outputs.has == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
           cache-dependency-path: apps/backend/package-lock.json
+
+      - name: Set up Node.js 20 (no cache)
+        if: steps.lock_backend.outputs.has != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Install backend deps (ci→install fallback)
         working-directory: apps/backend
@@ -60,7 +79,7 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
-      - name: Start backend and wait for /api/health (Secrets DB)
+      - name: Start backend and wait for /api/health (Secrets DB, diagnostic)
         working-directory: apps/backend
         env:
           DB_HOST: ${{ secrets.SMOKE_DB_HOST }}
@@ -72,21 +91,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (nohup npm start >/tmp/backend.log 2>&1 &) || (nohup node index.js >/tmp/backend.log 2>&1 &)
-          for i in {1..60}; do
-            if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null; then
-              echo "✅ Health OK at /api/health (port ${PORT})"
-              exit 0
-            fi
+          echo "ENV summary:"
+          echo "  DB_HOST=$DB_HOST"
+          echo "  DB_PORT=$DB_PORT"
+          echo "  DB_USER=$DB_USER"
+          echo "  DB_NAME=$DB_NAME"
+          echo "  APP PORT=$PORT (masked if coming from secrets)"
+          echo
+
+          # Prefer plain node to avoid nodemon quirks in CI
+          (nohup node index.js >/tmp/backend.log 2>&1 &) || (nohup npm start >/tmp/backend.log 2>&1 &)
+
+          # Try likely ports: $PORT, 3000, 3001
+          try_ports=("$PORT" "3000" "3001")
+
+          for i in {1..90}; do
+            for p in "${try_ports[@]}"; do
+              if curl -fsS "http://127.0.0.1:${p}/api/health" >/dev/null 2>&1; then
+                echo "✅ Health OK at /api/health on port ${p}"
+                exit 0
+              fi
+            done
             sleep 1
           done
-          echo "❌ Health check failed. Last 200 lines of backend log:"
+
+          echo "❌ Health check failed after 90s."
+          echo "---- Last 200 lines of backend.log ----"
           tail -n 200 /tmp/backend.log || true
+          echo "---- Listening ports (TCP) ----"
+          ss -ltnp || true
+          echo "---- Node/npm versions ----"
+          node -v || true
+          npm -v || true
           exit 1
 
-  # -----------------------------------
-  # Job B: EPHEMERAL Postgres (using secrets for creds)
-  # -----------------------------------
+  # ------------------------------------------------------------
+  # Job B: Run an EPHEMERAL Postgres on the runner (creds from secrets)
+  # ------------------------------------------------------------
   smoke_ephemeral:
     if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB != true
     name: Smoke (Ephemeral DB via Secrets)
@@ -114,30 +155,49 @@ jobs:
           EP_DB_USER:     ${{ secrets.SMOKE_DB_USER }}
           EP_DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
           EP_DB_NAME:     ${{ secrets.SMOKE_DB_NAME }}
+          CONTAINER: sbx_pg_${{ github.run_id }}
         shell: bash
         run: |
           set -euo pipefail
-          docker rm -f sbx_pg 2>/dev/null || true
-          docker run -d --name sbx_pg -p 5432:5432 \
+          docker rm -f "$CONTAINER" 2>/dev/null || true
+          docker run -d --name "$CONTAINER" -p 5432:5432 \
             -e POSTGRES_USER="$EP_DB_USER" \
             -e POSTGRES_PASSWORD="$EP_DB_PASSWORD" \
             -e POSTGRES_DB="$EP_DB_NAME" \
             postgres:15
-          # wait for readiness
+
+          echo "Waiting for Postgres to be ready…"
           for i in {1..60}; do
-            if docker exec sbx_pg pg_isready -U "$EP_DB_USER" -d "$EP_DB_NAME" >/dev/null 2>&1; then
+            if docker exec "$CONTAINER" pg_isready -U "$EP_DB_USER" -d "$EP_DB_NAME" >/dev/null 2>&1; then
               echo "Ephemeral Postgres is ready."
               break
             fi
             sleep 2
           done
 
-      - name: Set up Node.js 20
+      - name: Detect backend lockfile
+        id: lock_backend
+        shell: bash
+        run: |
+          if [ -f "apps/backend/package-lock.json" ]; then
+            echo "has=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js 20 (with npm cache)
+        if: steps.lock_backend.outputs.has == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
           cache-dependency-path: apps/backend/package-lock.json
+
+      - name: Set up Node.js 20 (no cache)
+        if: steps.lock_backend.outputs.has != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Install backend deps (ci→install fallback)
         working-directory: apps/backend
@@ -154,7 +214,7 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
-      - name: Start backend and wait for /api/health (Ephemeral DB via Secrets)
+      - name: Start backend and wait for /api/health (Ephemeral DB via Secrets, diagnostic)
         working-directory: apps/backend
         env:
           DB_HOST: 127.0.0.1
@@ -163,19 +223,47 @@ jobs:
           DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
           DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
           PORT: ${{ secrets.SMOKE_APP_PORT || '3000' }}
+          CONTAINER: sbx_pg_${{ github.run_id }}
         shell: bash
         run: |
           set -euo pipefail
-          (nohup npm start >/tmp/backend.log 2>&1 &) || (nohup node index.js >/tmp/backend.log 2>&1 &)
-          for i in {1..60}; do
-            if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null; then
-              echo "✅ Health OK at /api/health (port ${PORT})"
-              exit 0
-            fi
+          echo "ENV summary:"
+          echo "  DB_HOST=$DB_HOST"
+          echo "  DB_PORT=$DB_PORT"
+          echo "  DB_USER=$DB_USER"
+          echo "  DB_NAME=$DB_NAME"
+          echo "  APP PORT=$PORT (masked if coming from secrets)"
+          echo
+
+          (nohup node index.js >/tmp/backend.log 2>&1 &) || (nohup npm start >/tmp/backend.log 2>&1 &)
+
+          try_ports=("$PORT" "3000" "3001")
+
+          for i in {1..90}; do
+            for p in "${try_ports[@]}"; do
+              if curl -fsS "http://127.0.0.1:${p}/api/health" >/dev/null 2>&1; then
+                echo "✅ Health OK at /api/health on port ${p}"
+                # show a peek of DB logs (optional)
+                docker logs --tail=50 "$CONTAINER" || true
+                exit 0
+              fi
+            done
             sleep 1
           done
-          echo "❌ Health check failed. Last 200 lines of backend log:"
+
+          echo "❌ Health check failed after 90s."
+          echo "---- Last 200 lines of backend.log ----"
           tail -n 200 /tmp/backend.log || true
-          # show DB logs too (helps debugging)
-          docker logs --tail=200 sbx_pg || true
+          echo "---- Listening ports (TCP) ----"
+          ss -ltnp || true
+          echo "---- Postgres (ephemeral) last logs ----"
+          docker logs --tail=200 "$CONTAINER" || true
           exit 1
+
+      - name: Cleanup ephemeral Postgres
+        if: always()
+        env:
+          CONTAINER: sbx_pg_${{ github.run_id }}
+        shell: bash
+        run: |
+          docker rm -f "$CONTAINER" 2>/dev/null || true
