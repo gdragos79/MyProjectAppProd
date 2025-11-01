@@ -1,153 +1,105 @@
-name: STG SBX (build → push → deploy on self-hosted → health → promote tag)
+name: STAGING SBX (build → push base + prod-candidate → deploy to staging)
 
 on:
   workflow_dispatch:
+    inputs:
+      BASE_TAG:
+        description: "Base tag to create (e.g. 01_11_2025_v0.8_restructure-monorepo)"
+        required: true
+        type: string
 
 permissions:
   contents: read
   packages: write
 
 env:
-  APP_DIR: apps/backend
   REGISTRY: ghcr.io
-  STAGING_PORT: "3001"   # host port for staging backend (container uses 3000)
+  # 👇 Choose ONE and keep consistent with Production
+  PKG_NAME: myprojectapp-backend
+  # PKG_NAME: myprojectappprod-backend
+  APP_DIR: apps/backend
+  STAGING_PORT_HOST: "3001"   # host port on Staging VM
+  CONTAINER_PORT: "3000"      # app listens inside container
 
 jobs:
   build_and_push:
     if: github.ref_name == 'restructure/monorepo'
     runs-on: ubuntu-latest
-
     outputs:
-      TAG: ${{ steps.meta.outputs.TAG }}
-      IMAGE_B: ${{ steps.meta.outputs.IMAGE_B }}
-      IMAGE_B_PROD: ${{ steps.meta.outputs.IMAGE_B_PROD }}
-
+      IMAGE_BASE: ${{ steps.meta.outputs.IMAGE_BASE }}
+      IMAGE_PC:   ${{ steps.meta.outputs.IMAGE_PC }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compute image names and tag
+      - name: Compute tags
         id: meta
-        shell: bash
         run: |
           set -euo pipefail
-          DATE=$(date +%d_%m_%Y)
-          # +0.1 per workflow run
-          VRAW=$(awk -v n="$GITHUB_RUN_NUMBER" 'BEGIN{printf "%.1f", n/10}')
-          VERSION="v${VRAW}"
-          BRANCH_SAFE="${GITHUB_REF_NAME//\//-}"
-
           OWNER="${GITHUB_REPOSITORY%/*}"
           REPO="${GITHUB_REPOSITORY#*/}"
           OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
           REPO_LC=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
 
-          TAG="${DATE}_${VERSION}_${BRANCH_SAFE}"
-          IMAGE_B="${REGISTRY}/${OWNER_LC}/${REPO_LC}-backend:${TAG}"
-          IMAGE_B_PROD="${REGISTRY}/${OWNER_LC}/${REPO_LC}-backend:prod-candidate_${TAG}"
+          BASE="${{ inputs.BASE_TAG }}"
+          IMAGE_BASE="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:${BASE}"
+          IMAGE_PC="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:prod-candidate_${BASE}"
 
-          {
-            echo "TAG=$TAG"
-            echo "IMAGE_B=$IMAGE_B"
-            echo "IMAGE_B_PROD=$IMAGE_B_PROD"
-          } >> "$GITHUB_OUTPUT"
+          echo "IMAGE_BASE=$IMAGE_BASE" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_PC=$IMAGE_PC"     >> "$GITHUB_OUTPUT"
+          echo "Base tag: $IMAGE_BASE"
+          echo "Prod-candidate tag: $IMAGE_PC"
 
-          echo "Computed:"
-          echo "  TAG=$TAG"
-          echo "  IMAGE_B=$IMAGE_B"
-          echo "  IMAGE_B_PROD=$IMAGE_B_PROD"
-
-      - name: Login to GHCR (runner)
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push backend image
-        working-directory: ${{ env.APP_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker buildx create --use --name xbuilder || docker buildx use xbuilder
-          docker buildx build \
-            -f Dockerfile \
-            -t "${{ steps.meta.outputs.IMAGE_B }}" \
-            --push \
-            .
+      - name: Build & push both tags
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile      # adjust if your Dockerfile lives elsewhere
+          push: true
+          build-args: |
+            NODE_ENV=production
+          tags: |
+            ${{ steps.meta.outputs.IMAGE_BASE }}
+            ${{ steps.meta.outputs.IMAGE_PC }}
+            ${{ env.REGISTRY }}/gdragos79/${{ env.PKG_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Promote to prod-candidate tag (registry only; no deploy)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "${{ steps.meta.outputs.IMAGE_B }}"
-          docker tag  "${{ steps.meta.outputs.IMAGE_B }}" "${{ steps.meta.outputs.IMAGE_B_PROD }}"
-          docker push "${{ steps.meta.outputs.IMAGE_B_PROD }}"
-
-  deploy_to_staging:
-    if: github.ref_name == 'restructure/monorepo'
+  deploy_staging:
     needs: build_and_push
     runs-on: [self-hosted, staging]
     environment: Staging
-
     steps:
-      - name: Show runner info (self-hosted)
-        shell: bash
+      - name: Show runner info
         run: |
           set -euo pipefail
-          echo "Runner: $(hostname) / $(uname -a)"
+          echo "Runner: $(hostname)"
           docker --version || true
-          which docker || true
-          which curl || (sudo apt-get update -y && sudo apt-get install -y curl)
 
-      - name: Login to GHCR (self-hosted runner)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull image
-        shell: bash
+      - name: Pull the prod-candidate image
         env:
-          IMAGE_B: ${{ needs.build_and_push.outputs.IMAGE_B }}
+          IMAGE_PC: ${{ needs.build_and_push.outputs.IMAGE_PC }}
         run: |
           set -euo pipefail
-          docker pull "$IMAGE_B"
+          docker pull "$IMAGE_PC"
 
-      - name: Free host port ${{ env.STAGING_PORT }} if used by other container(s)
-        shell: bash
+      - name: Stop & remove any prior container on port ${{ env.STAGING_PORT_HOST }}
         run: |
           set -euo pipefail
-          # Stop/remove any container that publishes STAGING_PORT
-          CIDS=$(docker ps -q --filter "publish=${{ env.STAGING_PORT }}")
-          if [ -n "$CIDS" ]; then
-            echo "Port ${{ env.STAGING_PORT }} is in use by container(s): $CIDS — stopping them..."
-            docker rm -f $CIDS || true
-          fi
-          # If still busy, show what holds it (not a container)
-          if ss -ltnp | grep -q ":${{ env.STAGING_PORT }} "; then
-            echo "❌ Port ${{ env.STAGING_PORT }} still busy (non-Docker process):"
-            ss -ltnp | grep ":${{ env.STAGING_PORT }} " || true
-            exit 1
-          fi
+          # Remove containers publishing the staging host port
+          CIDS=$(docker ps -q --filter "publish=${{ env.STAGING_PORT_HOST }}")
+          if [ -n "$CIDS" ]; then docker rm -f $CIDS || true; fi
 
-      - name: Remove previous staging containers by name prefix
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Optional cleanup of old stgContainer_* by name
-          OLD=$(docker ps -a --filter "name=^stgContainer_" -q)
-          if [ -n "$OLD" ]; then
-            echo "Removing previous staging containers: $OLD"
-            docker rm -f $OLD || true
-          fi
-
-      - name: Run new container (host ${{ env.STAGING_PORT }} → container 3000)
-        shell: bash
+      - name: Run new staging container
         env:
-          IMAGE_B: ${{ needs.build_and_push.outputs.IMAGE_B }}
-          TAG:     ${{ needs.build_and_push.outputs.TAG }}
+          IMAGE_PC: ${{ needs.build_and_push.outputs.IMAGE_PC }}
           DB_HOST: ${{ secrets.DB_HOST_STAGING }}
           DB_PORT: ${{ secrets.DB_PORT_STAGING }}
           DB_USER: ${{ secrets.DB_USER_STAGING }}
@@ -155,7 +107,7 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME_STAGING }}
         run: |
           set -euo pipefail
-          NAME="stgContainer_${TAG}"
+          NAME="stgContainer_${{ inputs.BASE_TAG }}"
           docker run -d --name "$NAME" \
             --label app=staging-backend \
             -e DB_HOST="$DB_HOST" \
@@ -163,30 +115,21 @@ jobs:
             -e DB_USER="$DB_USER" \
             -e DB_PASSWORD="$DB_PASS" \
             -e DB_NAME="$DB_NAME" \
-            -e PORT="3000" \
-            -p ${STAGING_PORT}:3000 \
-            "$IMAGE_B"
-          echo "Started container: $NAME"
+            -e PORT="${{ env.CONTAINER_PORT }}" \
+            -p ${{ env.STAGING_PORT_HOST }}:${{ env.CONTAINER_PORT }} \
+            "$IMAGE_PC"
           docker ps --filter "name=$NAME"
 
-      - name: Health check /api/health on 127.0.0.1:${{ env.STAGING_PORT }}
-        shell: bash
-        env:
-          TAG: ${{ needs.build_and_push.outputs.TAG }}
+      - name: Health check on Staging VM
         run: |
           set -euo pipefail
-          NAME="stgContainer_${TAG}"
           for i in {1..60}; do
-            if curl -fsS "http://127.0.0.1:${STAGING_PORT}/api/health" >/dev/null 2>&1; then
-              echo "✅ Staging health OK at /api/health (port ${STAGING_PORT})"
-              docker ps --filter "name=$NAME"
+            if curl -fsS "http://127.0.0.1:${{ env.STAGING_PORT_HOST }}/api/health" >/dev/null 2>&1; then
+              echo "✅ Staging healthy."
               exit 0
             fi
             sleep 2
           done
-
-          echo "❌ Staging health failed. Recent logs:"
-          docker logs --tail=200 "$NAME" || true
-          echo "---- Open TCP ports ----"
-          ss -ltnp || true
+          echo "❌ Staging did not become healthy."
+          docker logs --tail=200 $(docker ps -q --filter "label=app=staging-backend") || true
           exit 1
