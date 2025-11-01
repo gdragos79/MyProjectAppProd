@@ -13,17 +13,13 @@ on:
         default: false
 
 permissions:
-  contents: write   # needed only if you ever toggle the push/merge inputs to true
+  contents: write   # only needed if you toggle push/merge inputs to true
   packages: read
 
 jobs:
   ci:
     # allow running on your test & env branches
-    if: >
-      github.ref_name == 'restructure/monorepo' ||
-      github.ref_name == 'Development' ||
-      github.ref_name == 'Staging' ||
-      github.ref_name == 'Production'
+    if: ${{ github.ref_name == 'restructure/monorepo' || github.ref_name == 'Development' || github.ref_name == 'Staging' || github.ref_name == 'Production' }}
     runs-on: ubuntu-latest
     environment:
       name: Development-SBX
@@ -44,10 +40,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # -----------------------------
       # 1) Prepare a local scratch branch = dev-ci
-      #    Start from origin/Development and merge origin/main into it (LOCAL ONLY).
-      # -----------------------------
       - name: Create local dev-ci from origin/Development and merge origin/main
         run: |
           set -e
@@ -58,9 +51,7 @@ jobs:
           git merge --no-edit origin/main
           # Stay on dev-ci for testing
 
-      # -----------------------------
       # 2) BACKEND: install, test
-      # -----------------------------
       - name: Backend - install deps (npm ci)
         working-directory: apps/backend
         run: npm ci
@@ -77,9 +68,7 @@ jobs:
           # If you haven't added tests yet, this will exit 0 but remind you to add them.
           npm test -- --runInBand || echo "No backend tests yet? Add a Jest+Supertest health test."
 
-      # -----------------------------
       # 3) FRONTEND: install, build
-      # -----------------------------
       - name: Frontend - install deps (npm ci)
         working-directory: apps/frontend
         run: npm ci
@@ -88,23 +77,18 @@ jobs:
         working-directory: apps/frontend
         run: npm run build
 
-      # -----------------------------
-      # 4) OPTIONAL: push dev-ci → origin/Development
-      #    Only if you toggle SYNC_DEVELOPMENT=true when dispatching.
-      # -----------------------------
+      # 4) OPTIONAL: push dev-ci → origin/Development (only if SYNC_DEVELOPMENT=true)
       - name: Push dev-ci to origin/Development (optional)
-        if: inputs.SYNC_DEVELOPMENT == true
+        if: ${{ inputs.SYNC_DEVELOPMENT }}
         run: |
           set -e
           git checkout -B Development origin/Development
           git merge --ff-only dev-ci || git merge --no-edit dev-ci
           git push --force-with-lease origin HEAD:Development
 
-      # -----------------------------
       # 5) OPTIONAL: merge Development → main (only if MERGE_TO_MAIN=true)
-      # -----------------------------
       - name: Merge Development into main (optional)
-        if: inputs.MERGE_TO_MAIN == true
+        if: ${{ inputs.MERGE_TO_MAIN }}
         run: |
           set -e
           git checkout main
