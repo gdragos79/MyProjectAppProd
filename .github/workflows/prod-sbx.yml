@@ -37,7 +37,11 @@ env:
 
 jobs:
   resolve_image:
-    if: github.ref_name == 'restructure/monorepo'
+    if: >
+      github.ref_name == 'restructure/monorepo' ||
+      github.ref_name == 'Development' ||
+      github.ref_name == 'Staging' ||
+      github.ref_name == 'Production'
     runs-on: ubuntu-latest
     outputs:
       IMAGE_PULL: ${{ steps.choose.outputs.IMAGE_PULL }}
