@@ -19,7 +19,11 @@ permissions:
 jobs:
   ci:
     # guard: only run from the test branch
-    if: github.ref_name == 'restructure/monorepo'
+    if: >
+  github.ref_name == 'restructure/monorepo' ||
+  github.ref_name == 'Development' ||
+  github.ref_name == 'Staging' ||
+  github.ref_name == 'Production'
     runs-on: ubuntu-latest
     # use your sandbox environment (with DEV_* secrets)
     environment:
