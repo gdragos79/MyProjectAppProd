@@ -87,7 +87,7 @@ jobs:
           echo "---- package.json (scripts) ----"
           jq -r '.scripts // {}' package.json || cat package.json
 
-      - name: Start backend and discover health (Secrets DB; auto-detect entry/port/path)
+      - name: Start backend and live-diagnose (Secrets DB; fixed PORT=3000)
         working-directory: apps/backend
         env:
           DB_HOST: ${{ secrets.SMOKE_DB_HOST }}
@@ -95,7 +95,8 @@ jobs:
           DB_USER: ${{ secrets.SMOKE_DB_USER }}
           DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
           DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
-          # NOTE: We do NOT set PORT here (avoid masked values). App should default or we detect actual port.
+          PORT: "3000"                       # force known port; not secret, no masking
+          NODE_OPTIONS: "--unhandled-rejections=strict --trace-uncaught"
         shell: bash
         run: |
           set -euo pipefail
@@ -105,6 +106,7 @@ jobs:
           echo "  DB_PORT=$DB_PORT"
           echo "  DB_USER=$DB_USER"
           echo "  DB_NAME=$DB_NAME"
+          echo "  PORT=$PORT"
           echo
 
           ENTRY=""
@@ -113,34 +115,25 @@ jobs:
           done
           if [ -z "$ENTRY" ]; then
             echo "No backend entry file found (index.js/server.js/app.js/src/index.js)."
-            echo "Listing tree for debugging:"
             ls -R
             exit 1
           fi
           echo "Using entry file: $ENTRY"
+          echo "---- Begin $ENTRY ----"
+          sed -n '1,200p' "$ENTRY" || true
+          echo "---- End $ENTRY ----"
 
-          # Start backend (prefer plain node; fallback to npm start)
+          # Start backend and stream logs while probing
           set +e
           nohup node "$ENTRY" >/tmp/backend.log 2>&1 &
-          NODE_PID=$!
-          sleep 2
-          if ! ps -p "$NODE_PID" >/dev/null 2>&1; then
-            echo "node $ENTRY did not stay running; trying npm start if present…"
-            if npm run | grep -qE '^\s*start'; then
-              nohup npm start >/tmp/backend.log 2>&1 &
-            else
-              echo "No start script found and node failed to stay up." >&2
-              set -e
-              tail -n 200 /tmp/backend.log || true
-              exit 1
-            fi
-          fi
+          APP_PID=$!
           set -e
 
-          # Probe for up to 120s:
-          # 1) discover real listening ports owned by node,
-          # 2) try /api/health and /health on each,
-          # 3) also try common fallbacks 3000/3001/8080
+          # background log streamer
+          ( for i in {1..60}; do echo "---- backend.log tick $i ----"; tail -n 50 /tmp/backend.log || true; sleep 2; done ) &
+          LOGGER_PID=$!
+
+          # Probe up to 120s: discover node ports + try /api/health and /health; also try common ports
           for i in {1..120}; do
             CAND_PORTS=$(ss -ltnp 2>/dev/null | awk '/node/ {print $4}' | sed 's/.*://g' | sort -u | tr '\n' ' ')
             TEST_PORTS="$CAND_PORTS 3000 3001 8080"
@@ -148,6 +141,7 @@ jobs:
               for path in /api/health /health; do
                 if curl -fsS "http://127.0.0.1:${p}${path}" >/dev/null 2>&1; then
                   echo "✅ Health OK at ${path} on port ${p}"
+                  kill "$LOGGER_PID" 2>/dev/null || true
                   exit 0
                 fi
               done
@@ -158,8 +152,9 @@ jobs:
           echo "❌ Health check failed after 120s."
           echo "---- Listening ports (TCP) ----"
           ss -ltnp || true
-          echo "---- Last 200 lines of backend.log ----"
+          echo "---- Final backend.log tail ----"
           tail -n 200 /tmp/backend.log || true
+          kill "$LOGGER_PID" 2>/dev/null || true
           exit 1
 
   # ------------------------------------------------------------
@@ -261,7 +256,7 @@ jobs:
           echo "---- package.json (scripts) ----"
           jq -r '.scripts // {}' package.json || cat package.json
 
-      - name: Start backend and discover health (Ephemeral DB; auto-detect entry/port/path)
+      - name: Start backend and live-diagnose (Ephemeral DB; fixed PORT=3000)
         working-directory: apps/backend
         env:
           DB_HOST: 127.0.0.1
@@ -269,6 +264,8 @@ jobs:
           DB_USER: ${{ secrets.SMOKE_DB_USER }}
           DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
           DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
+          PORT: "3000"                       # force known port; not secret
+          NODE_OPTIONS: "--unhandled-rejections=strict --trace-uncaught"
           CONTAINER: sbx_pg_${{ github.run_id }}
         shell: bash
         run: |
@@ -279,6 +276,7 @@ jobs:
           echo "  DB_PORT=$DB_PORT"
           echo "  DB_USER=$DB_USER"
           echo "  DB_NAME=$DB_NAME"
+          echo "  PORT=$PORT"
           echo
 
           ENTRY=""
@@ -287,28 +285,22 @@ jobs:
           done
           if [ -z "$ENTRY" ]; then
             echo "No backend entry file found (index.js/server.js/app.js/src/index.js)."
-            echo "Listing tree for debugging:"
             ls -R
             exit 1
           fi
           echo "Using entry file: $ENTRY"
+          echo "---- Begin $ENTRY ----"
+          sed -n '1,200p' "$ENTRY" || true
+          echo "---- End $ENTRY ----"
 
           set +e
           nohup node "$ENTRY" >/tmp/backend.log 2>&1 &
-          NODE_PID=$!
-          sleep 2
-          if ! ps -p "$NODE_PID" >/dev/null 2>&1; then
-            echo "node $ENTRY did not stay running; trying npm start if present…"
-            if npm run | grep -qE '^\s*start'; then
-              nohup npm start >/tmp/backend.log 2>&1 &
-            else
-              echo "No start script found and node failed to stay up." >&2
-              set -e
-              tail -n 200 /tmp/backend.log || true
-              exit 1
-            fi
-          fi
+          APP_PID=$!
           set -e
+
+          # stream logs while probing
+          ( for i in {1..60}; do echo "---- backend.log tick $i ----"; tail -n 50 /tmp/backend.log || true; sleep 2; done ) &
+          LOGGER_PID=$!
 
           for i in {1..120}; do
             CAND_PORTS=$(ss -ltnp 2>/dev/null | awk '/node/ {print $4}' | sed 's/.*://g' | sort -u | tr '\n' ' ')
@@ -318,6 +310,7 @@ jobs:
                 if curl -fsS "http://127.0.0.1:${p}${path}" >/dev/null 2>&1; then
                   echo "✅ Health OK at ${path} on port ${p}"
                   docker logs --tail=50 "$CONTAINER" || true
+                  kill "$LOGGER_PID" 2>/dev/null || true
                   exit 0
                 fi
               done
@@ -328,10 +321,11 @@ jobs:
           echo "❌ Health check failed after 120s."
           echo "---- Listening ports (TCP) ----"
           ss -ltnp || true
-          echo "---- Last 200 lines of backend.log ----"
+          echo "---- Final backend.log tail ----"
           tail -n 200 /tmp/backend.log || true
           echo "---- Postgres (ephemeral) last logs ----"
           docker logs --tail=200 "$CONTAINER" || true
+          kill "$LOGGER_PID" 2>/dev/null || true
           exit 1
 
       - name: Cleanup ephemeral Postgres
