@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           DATE=$(date +%d_%m_%Y)
-          # Version increases by 0.1 every run of this workflow
+          # Version increases by 0.1 per run of this workflow
           VRAW=$(awk -v n="$GITHUB_RUN_NUMBER" 'BEGIN{printf "%.1f", n/10}')
           VERSION="v${VRAW}"
           BRANCH_SAFE="${GITHUB_REF_NAME//\//-}"
@@ -82,7 +82,7 @@ jobs:
     if: github.ref_name == 'restructure/monorepo'
     needs: build_and_push
     runs-on: ubuntu-latest
-    environment: Staging   # your Staging environment with the secrets below
+    environment: Staging   # uses your Staging environment secrets
 
     steps:
       - name: Write SSH key (STAGING_SSH_KEY)
@@ -104,10 +104,6 @@ jobs:
           HOST:     ${{ secrets.STAGING_SSH_HOST }}
           USER:     ${{ secrets.STAGING_SSH_USER }}
 
-          # GHCR creds for the REMOTE VM (prefer STAGING_GHCR_PAT if you add it)
-          CR_USER:  ${{ secrets.STAGING_GHCR_USER || github.actor }}
-          CR_PAT:   ${{ secrets.STAGING_GHCR_PAT || secrets.GHCR_PAT }}
-
           # Image info
           IMAGE_B:  ${{ needs.build_and_push.outputs.IMAGE_B }}
           TAG:      ${{ needs.build_and_push.outputs.TAG }}
@@ -118,20 +114,30 @@ jobs:
           DB_USER:  ${{ secrets.DB_USER_STAGING }}
           DB_PASS:  ${{ secrets.DB_PASSWORD_STAGING }}
           DB_NAME:  ${{ secrets.DB_NAME_STAGING }}
+
+          # GHCR pull credentials for the REMOTE VM
+          # Provide at least one of these in the Staging environment:
+          STAGING_GHCR_USER: ${{ secrets.STAGING_GHCR_USER }}
+          STAGING_GHCR_PAT:  ${{ secrets.STAGING_GHCR_PAT }}
+          GHCR_PAT:          ${{ secrets.GHCR_PAT }}
         run: |
           set -euo pipefail
 
-          if [ -z "${CR_PAT}" ]; then
-            echo "Missing a GHCR token for the REMOTE VM."
-            echo "Please add STAGING_GHCR_PAT (preferred) or GHCR_PAT to the Staging environment."
+          # choose creds: prefer STAGING_GHCR_* then GHCR_PAT (with runner actor)
+          CR_USER="${STAGING_GHCR_USER:-${GITHUB_ACTOR}}"
+          if [ -n "${STAGING_GHCR_PAT:-}" ]; then
+            CR_PAT="${STAGING_GHCR_PAT}"
+          elif [ -n "${GHCR_PAT:-}" ]; then
+            CR_PAT="${GHCR_PAT}"
+          else
+            echo "Missing GHCR token for REMOTE VM: add STAGING_GHCR_PAT (preferred) or GHCR_PAT in Staging env." >&2
             exit 1
           fi
 
           echo "Connecting to ${USER}@${HOST} …"
-          ssh -i ~/.ssh/id_ed25519 "${USER}@${HOST}" bash -s -- <<EOF
+          ssh -i ~/.ssh/id_ed25519 "${USER}@${HOST}" bash -s <<EOF
           set -euo pipefail
 
-          # Inject vars from the runner
           CR_USER="${CR_USER}"
           CR_PAT="${CR_PAT}"
           IMAGE_B="${IMAGE_B}"
