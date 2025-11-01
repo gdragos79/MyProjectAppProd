@@ -1,34 +1,26 @@
 # syntax=docker/dockerfile:1
 
-# --- Base image
+# Base image
 FROM node:20-alpine AS base
 WORKDIR /app
-
-# --- Install dependencies using backend's lockfile
-FROM base AS deps
-# copy ONLY backend's manifest files
-COPY backend/package*.json ./
-RUN npm ci
-
-# --- Runtime image
-FROM node:20-alpine AS runtime
-WORKDIR /app
-ENV NODE_ENV=production
-
-# Prisma engines & many libs need openssl on Alpine
 RUN apk add --no-cache openssl
 
-# bring in deps first for better layer caching
+# Install dependencies separately for caching
+FROM base AS deps
+COPY package*.json ./
+# Use full install; we will run `node index.js` (no nodemon required)
+RUN npm ci
+
+# Runtime image
+FROM base AS runtime
+ENV NODE_ENV=production
+# Copy node_modules from deps stage
 COPY --from=deps /app/node_modules ./node_modules
+# Copy app source (from apps/backend context)
+COPY . .
 
-# copy the backend source into the image
-COPY backend/. .
-
-# generate prisma client if present; no-op otherwise
-RUN npx prisma generate || true
-
-# adjust if your backend listens on a different port
-ENV PORT=3000
+# Expose the backend port
 EXPOSE 3000
 
+# Start the server directly with Node (avoids needing dev deps like nodemon)
 CMD ["node", "index.js"]
