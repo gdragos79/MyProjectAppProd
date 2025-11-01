@@ -1,10 +1,10 @@
-name: PROD SBX (blue/green deploy → flip proxy → soak → rollback)
+name: "PROD SBX (blue/green deploy → flip proxy → soak → rollback)"
 
 on:
   workflow_dispatch:
     inputs:
       IMAGE_TAG_BASE:
-        description: "Base tag from Staging (e.g. 01_11_2025_v0.9). Prod will try prod-candidate_<tag> first, then <tag>."
+        description: "Base tag from Staging (e.g. 01_11_2025_v0.9). Prod tries prod-candidate_<tag> first, then <tag>."
         type: string
         required: true
       TARGET_OVERRIDE:
@@ -27,35 +27,52 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  PKG_NAME: myprojectapp-backend      # ← match Staging SBX
-  PROD_PORT: "3000"                   # backend listens on 3000; proxy points to VM:3000
+  PKG_NAME: myprojectapp-backend     # must match Staging package name
+  PROD_PORT: "3000"
 
   # Proxy paths (you confirmed these)
-  ACTIVE_LINK: /etc/nginx/upstreams/active.conf
-  BLUE_CONF:  /etc/nginx/upstreams-available/upstream-blue.conf
-  GREEN_CONF: /etc/nginx/upstreams-available/upstream-green.conf
+  ACTIVE_LINK: "/etc/nginx/upstreams/active.conf"
+  BLUE_CONF:  "/etc/nginx/upstreams-available/upstream-blue.conf"
+  GREEN_CONF: "/etc/nginx/upstreams-available/upstream-green.conf"
 
 jobs:
   resolve_image:
     if: github.ref_name == 'restructure/monorepo'
     runs-on: ubuntu-latest
     outputs:
-      IMAGE_PULL: ${{ steps.pick.outputs.IMAGE_PULL }}
-      BASE_TAG:   ${{ steps.pick.outputs.BASE_TAG }}
+      IMAGE_PULL: ${{ steps.choose.outputs.IMAGE_PULL }}
+      BASE_TAG:   ${{ steps.choose.outputs.BASE_TAG }}
     steps:
-      - name: Compute & pick image
-        id: pick
+      - name: Compute candidate tags
+        id: meta
         shell: bash
         run: |
           set -euo pipefail
           OWNER="${GITHUB_REPOSITORY%/*}"
           OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
           BASE="${{ inputs.IMAGE_TAG_BASE }}"
+          echo "OWNER_LC=$OWNER_LC" >> "$GITHUB_OUTPUT"
+          echo "BASE=$BASE"         >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pick image (prod-candidate or base)
+        id: choose
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER_LC="${{ steps.meta.outputs.OWNER_LC }}"
+          BASE="${{ steps.meta.outputs.BASE }}"
           IMG1="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:prod-candidate_${BASE}"
           IMG2="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:${BASE}"
-          echo "Trying to pull: $IMG1 …"
+
+          echo "Trying prod-candidate: $IMG1"
           if docker pull "$IMG1" >/dev/null 2>&1; then
-            echo "Using IMAGE_PULL=$IMG1"
             echo "IMAGE_PULL=$IMG1" >> "$GITHUB_OUTPUT"
             echo "BASE_TAG=$BASE"   >> "$GITHUB_OUTPUT"
             exit 0
@@ -63,7 +80,6 @@ jobs:
 
           echo "::warning::prod-candidate not found; trying base tag… ($IMG2)"
           if docker pull "$IMG2" >/dev/null 2>&1; then
-            echo "Using IMAGE_PULL=$IMG2"
             echo "IMAGE_PULL=$IMG2" >> "$GITHUB_OUTPUT"
             echo "BASE_TAG=$BASE"   >> "$GITHUB_OUTPUT"
             exit 0
@@ -72,18 +88,20 @@ jobs:
           echo "::error::Could not find either image:"
           echo "  - $IMG1"
           echo "  - $IMG2"
-          echo "Tip: verify Staging SBX pushed these tags and the BASE value is exact."
+          echo "Tip: verify Staging SBX pushed these tags and your IMAGE_TAG_BASE matches exactly."
           exit 1
 
   pick_target:
     needs: resolve_image
-    runs-on: [self-hosted, proxy]
+    runs-on:
+      - self-hosted
+      - proxy
     outputs:
       active_color: ${{ steps.pick.outputs.active_color }}
       target_color: ${{ steps.pick.outputs.target_color }}
-      target_label: ${{ steps.pick.outputs.target_label }} # maps to runner labels
+      target_label: ${{ steps.pick.outputs.target_label }}
     steps:
-      - name: Detect active color via proxy symlink and choose target
+      - name: Detect active color and choose target
         id: pick
         shell: bash
         run: |
@@ -98,7 +116,6 @@ jobs:
             ACTIVE=blue
           fi
 
-          # auto pick opposite unless override provided
           OV="${{ inputs.TARGET_OVERRIDE }}"
           if [[ "$OV" == "blue" || "$OV" == "green" ]]; then
             TARGET="$OV"
@@ -106,14 +123,10 @@ jobs:
             if [[ "$ACTIVE" == "blue" ]]; then TARGET="green"; else TARGET="blue"; fi
           fi
 
-          # map color -> runner label names in your repo
           case "$TARGET" in
             blue)  LABEL="app-blue" ;;
             green) LABEL="app-green" ;;
           esac
-
-          echo "Active: $ACTIVE"
-          echo "Target: $TARGET (runner label: $LABEL)"
 
           echo "active_color=$ACTIVE" >> "$GITHUB_OUTPUT"
           echo "target_color=$TARGET" >> "$GITHUB_OUTPUT"
@@ -121,13 +134,14 @@ jobs:
 
   deploy_to_target:
     needs: [resolve_image, pick_target]
-    runs-on: [self-hosted, ${{ needs.pick_target.outputs.target_label }}]
+    runs-on:
+      - self-hosted
+      - ${{ needs.pick_target.outputs.target_label }}
     environment: Production
     steps:
-      - name: Show runner info
+      - name: Info
         shell: bash
         run: |
-          set -euo pipefail
           echo "Runner: $(hostname)"
           docker --version || true
 
@@ -146,26 +160,26 @@ jobs:
           set -euo pipefail
           docker pull "$IMAGE"
 
-      - name: Free host port ${{ env.PROD_PORT }} (and remove any existing prod containers)
+      - name: Free port and remove old prod containers
         shell: bash
         run: |
           set -euo pipefail
-          # stop anything already publishing this port
-          CIDS=$(docker ps -q --filter "publish=${{ env.PROD_PORT }}")
+          # stop containers publishing the prod port
+          CIDS=$(docker ps -q --filter "publish=${PROD_PORT}")
           if [ -n "$CIDS" ]; then
-            echo "Stopping containers using port ${{ env.PROD_PORT }}: $CIDS"
+            echo "Stopping containers using port ${PROD_PORT}: $CIDS"
             docker rm -f $CIDS || true
           fi
-          # clean previous prod containers by label
+          # remove any older prod containers by label
           OLD=$(docker ps -a -q --filter "label=app=prod-backend")
           if [ -n "$OLD" ]; then
             echo "Removing old prod containers: $OLD"
             docker rm -f $OLD || true
           fi
-          # ensure port is really free
-          if ss -ltnp | grep -q ":${{ env.PROD_PORT }} "; then
-            echo "❌ Port ${{ env.PROD_PORT }} still busy by non-Docker process:"
-            ss -ltnp | grep ":${{ env.PROD_PORT }} " || true
+          # ensure port is free
+          if ss -ltnp | grep -q ":${PROD_PORT} "; then
+            echo "❌ Port ${PROD_PORT} still busy by non-Docker process:"
+            ss -ltnp | grep ":${PROD_PORT} " || true
             exit 1
           fi
 
@@ -194,7 +208,7 @@ jobs:
             "$IMAGE"
           docker ps --filter "name=$NAME"
 
-      - name: Local health check on target VM (pre-flip)
+      - name: Local health check (pre-flip)
         shell: bash
         run: |
           set -euo pipefail
@@ -211,10 +225,12 @@ jobs:
 
   flip_proxy_and_soak:
     needs: [resolve_image, pick_target, deploy_to_target]
-    runs-on: [self-hosted, proxy]
+    runs-on:
+      - self-hosted
+      - proxy
     environment: Production
     steps:
-      - name: Flip active.conf to target color and reload Nginx
+      - name: Flip proxy symlink and reload Nginx
         id: flip
         shell: bash
         env:
