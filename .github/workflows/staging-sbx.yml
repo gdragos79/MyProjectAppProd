@@ -107,6 +107,58 @@ jobs:
           set -euo pipefail
           ssh-keyscan -H "${{ secrets.STAGING_SSH_HOST }}" >> ~/.ssh/known_hosts
 
+      - name: Prepare remote deploy script (local file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > deploy_remote.sh <<'SCRIPT'
+#!/usr/bin/env bash
+# Args:
+#  1=CR_USER  2=CR_PAT  3=IMAGE_B  4=TAG
+#  5=DB_HOST  6=DB_PORT 7=DB_USER  8=DB_PASS 9=DB_NAME
+set -euo pipefail
+
+CR_USER="$1"; CR_PAT="$2"; IMAGE_B="$3"; TAG="$4"
+DB_HOST="$5"; DB_PORT="$6"; DB_USER="$7"; DB_PASS="$8"; DB_NAME="$9"
+
+echo "Docker login to GHCR on remote…"
+echo "$CR_PAT" | docker login ghcr.io -u "$CR_USER" --password-stdin
+
+echo "Pull image: $IMAGE_B"
+docker pull "$IMAGE_B"
+
+NAME="stgContainer_${TAG}"
+
+echo "Stop/remove old container (if any)…"
+docker rm -f "$NAME" 2>/dev/null || true
+
+echo "Run new container on host port 3001 → container 3000…"
+docker run -d --name "$NAME" \
+  -e DB_HOST="$DB_HOST" \
+  -e DB_PORT="$DB_PORT" \
+  -e DB_USER="$DB_USER" \
+  -e DB_PASSWORD="$DB_PASS" \
+  -e DB_NAME="$DB_NAME" \
+  -e PORT="3000" \
+  -p 3001:3000 \
+  "$IMAGE_B"
+
+echo "Wait for /api/health on 127.0.0.1:3001 …"
+for i in {1..60}; do
+  if curl -fsS "http://127.0.0.1:3001/api/health" >/dev/null 2>&1; then
+    echo "✅ Staging health OK at /api/health (port 3001)"
+    docker ps --filter "name=$NAME"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "❌ Staging health failed. Logs:"
+docker logs --tail=200 "$NAME" || true
+exit 1
+SCRIPT
+          chmod +x deploy_remote.sh
+
       - name: Deploy backend container on staging VM (port 3001)
         shell: bash
         env:
@@ -126,9 +178,6 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME_STAGING }}
 
           # GHCR pull credentials on the REMOTE VM
-          # Provide at least one of these in the Staging environment:
-          #   STAGING_GHCR_PAT (preferred), optionally STAGING_GHCR_USER
-          # or GHCR_PAT (falls back to github.actor as user)
           STAGING_GHCR_USER: ${{ secrets.STAGING_GHCR_USER }}
           STAGING_GHCR_PAT:  ${{ secrets.STAGING_GHCR_PAT }}
           GHCR_PAT:          ${{ secrets.GHCR_PAT }}
@@ -136,59 +185,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          # choose creds: prefer STAGING_GHCR_* then GHCR_PAT (with runner actor)
-          CR_USER="$STAGING_GHCR_USER"
-          [ -n "$CR_USER" ] || CR_USER="$ACTOR"
+          # Choose credentials: prefer STAGING_GHCR_* then GHCR_PAT (with runner actor)
+          CR_USER="${STAGING_GHCR_USER}"
+          if [ -z "$CR_USER" ]; then CR_USER="$ACTOR"; fi
 
-          CR_PAT="$STAGING_GHCR_PAT"
-          [ -n "$CR_PAT" ] || CR_PAT="$GHCR_PAT"
+          CR_PAT="${STAGING_GHCR_PAT}"
+          if [ -z "$CR_PAT" ]; then CR_PAT="$GHCR_PAT"; fi
 
           if [ -z "$CR_PAT" ]; then
             echo "Missing GHCR token for REMOTE VM: add STAGING_GHCR_PAT (preferred) or GHCR_PAT in Staging env." >&2
             exit 1
           fi
 
-          echo "Connecting to ${USER}@${HOST} …"
-          # Pass variables to the remote shell without heredocs (YAML-safe)
-          ssh -o StrictHostKeyChecking=yes -i ~/.ssh/id_ed25519 "${USER}@${HOST}" \
-          "CR_USER='$CR_USER' CR_PAT='$CR_PAT' IMAGE_B='$IMAGE_B' TAG='$TAG' \
-           DB_HOST='$DB_HOST' DB_PORT='$DB_PORT' DB_USER='$DB_USER' DB_PASS='$DB_PASS' DB_NAME='$DB_NAME' \
-           bash -se -c '
-set -euo pipefail
-echo \"Docker login to GHCR on remote…\"
-echo \"\$CR_PAT\" | docker login ghcr.io -u \"\$CR_USER\" --password-stdin
+          echo "Upload deploy script to remote…"
+          scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes ./deploy_remote.sh "${USER}@${HOST}:/tmp/deploy_remote.sh"
 
-echo \"Pull image: \$IMAGE_B\"
-docker pull \"\$IMAGE_B\"
-
-NAME=\"stgContainer_\$TAG\"
-
-echo \"Stop/remove old container (if any)…\"
-docker rm -f \"\$NAME\" 2>/dev/null || true
-
-echo \"Run new container on host port 3001 → container 3000…\"
-docker run -d --name \"\$NAME\" \
-  -e DB_HOST=\"\$DB_HOST\" \
-  -e DB_PORT=\"\$DB_PORT\" \
-  -e DB_USER=\"\$DB_USER\" \
-  -e DB_PASSWORD=\"\$DB_PASS\" \
-  -e DB_NAME=\"\$DB_NAME\" \
-  -e PORT=\"3000\" \
-  -p 3001:3000 \
-  \"\$IMAGE_B\"
-
-echo \"Wait for /api/health on 127.0.0.1:3001 …\"
-for i in {1..60}; do
-  if curl -fsS \"http://127.0.0.1:3001/api/health\" >/dev/null 2>&1; then
-    echo \"✅ Staging health OK at /api/health (port 3001)\"
-    docker ps --filter \"name=\$NAME\"
-    exit 0
-  fi
-  sleep 2
-done
-
-echo \"❌ Staging health failed. Logs:\"
-docker logs --tail=200 \"\$NAME\" || true
-exit 1
-'"
-
+          echo "Execute remote deploy…"
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes "${USER}@${HOST}" \
+            bash /tmp/deploy_remote.sh \
+              "$CR_USER" "$CR_PAT" "$IMAGE_B" "$TAG" \
+              "$DB_HOST" "$DB_PORT" "$DB_USER" "$DB_PASS" "$DB_NAME"
