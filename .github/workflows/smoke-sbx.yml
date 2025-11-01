@@ -1,0 +1,172 @@
+name: SBX Smoke (backend; secrets or ephemeral DB)
+
+on:
+  workflow_dispatch:
+    inputs:
+      USE_SECRETS_DB:
+        description: "Use DB connection from GitHub Secrets instead of ephemeral Postgres"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------
+  # Job A: uses DB from SECRETS
+  # --------------------------
+  smoke_secrets:
+    if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB == true
+    name: Smoke (Secrets DB)
+    runs-on: ubuntu-latest
+    environment: Development-SBX
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required secrets (external DB)
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${{ secrets.SMOKE_DB_HOST }}" ] || missing+=("SMOKE_DB_HOST")
+          [ -n "${{ secrets.SMOKE_DB_USER }}" ] || missing+=("SMOKE_DB_USER")
+          [ -n "${{ secrets.SMOKE_DB_PASSWORD }}" ] || missing+=("SMOKE_DB_PASSWORD")
+          [ -n "${{ secrets.SMOKE_DB_NAME }}" ] || missing+=("SMOKE_DB_NAME")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: apps/backend/package-lock.json
+
+      - name: Install backend deps (ci→install fallback)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            if ! npm ci; then
+              echo "npm ci failed → falling back to npm install"
+              rm -f package-lock.json
+              npm install --no-audit --no-fund
+            fi
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Start backend and wait for /api/health (Secrets DB)
+        working-directory: apps/backend
+        env:
+          DB_HOST: ${{ secrets.SMOKE_DB_HOST }}
+          DB_PORT: ${{ secrets.SMOKE_DB_PORT || '5432' }}
+          DB_USER: ${{ secrets.SMOKE_DB_USER }}
+          DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
+          PORT: ${{ secrets.SMOKE_APP_PORT || '3000' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (nohup npm start >/tmp/backend.log 2>&1 &) || (nohup node index.js >/tmp/backend.log 2>&1 &)
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null; then
+              echo "✅ Health OK at /api/health (port ${PORT})"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "❌ Health check failed. Last 200 lines of backend log:"
+          tail -n 200 /tmp/backend.log || true
+          exit 1
+
+  # -----------------------------------
+  # Job B: EPHEMERAL Postgres (but creds from SECRETS)
+  # -----------------------------------
+  smoke_ephemeral:
+    if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB != true
+    name: Smoke (Ephemeral DB via Secrets)
+    runs-on: ubuntu-latest
+    environment: Development-SBX
+
+    # Start a temporary Postgres that uses the SAME credentials you store in secrets
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ${{ secrets.SMOKE_DB_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.SMOKE_DB_NAME }}
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U ${{ secrets.SMOKE_DB_USER }} -d ${{ secrets.SMOKE_DB_NAME }}"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required secrets (ephemeral DB creds)
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${{ secrets.SMOKE_DB_USER }}" ] || missing+=("SMOKE_DB_USER")
+          [ -n "${{ secrets.SMOKE_DB_PASSWORD }}" ] || missing+=("SMOKE_DB_PASSWORD")
+          [ -n "${{ secrets.SMOKE_DB_NAME }}" ] || missing+=("SMOKE_DB_NAME")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: apps/backend/package-lock.json
+
+      - name: Install backend deps (ci→install fallback)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            if ! npm ci; then
+              echo "npm ci failed → falling back to npm install"
+              rm -f package-lock.json
+              npm install --no-audit --no-fund
+            fi
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Start backend and wait for /api/health (Ephemeral DB via Secrets)
+        working-directory: apps/backend
+        env:
+          # Point to the ephemeral DB exposed to the job on localhost:5432
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_USER: ${{ secrets.SMOKE_DB_USER }}
+          DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
+          PORT: ${{ secrets.SMOKE_APP_PORT || '3000' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (nohup npm start >/tmp/backend.log 2>&1 &) || (nohup node index.js >/tmp/backend.log 2>&1 &)
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null; then
+              echo "✅ Health OK at /api/health (port ${PORT})"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "❌ Health check failed. Last 200 lines of backend log:"
+          tail -n 200 /tmp/backend.log || true
+          exit 1
