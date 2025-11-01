@@ -1,0 +1,181 @@
+name: STG SBX (build → push → deploy backend → health → promote tag)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # push to GHCR from the GitHub runner
+
+env:
+  APP_DIR: apps/backend
+  REGISTRY: ghcr.io
+
+jobs:
+  build_and_push:
+    if: github.ref_name == 'restructure/monorepo'
+    runs-on: ubuntu-latest
+
+    outputs:
+      TAG: ${{ steps.meta.outputs.TAG }}
+      IMAGE_B: ${{ steps.meta.outputs.IMAGE_B }}
+      IMAGE_B_PROD: ${{ steps.meta.outputs.IMAGE_B_PROD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image names and tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATE=$(date +%d_%m_%Y)
+          # Version increases by 0.1 every run of this workflow
+          VRAW=$(awk -v n="$GITHUB_RUN_NUMBER" 'BEGIN{printf "%.1f", n/10}')
+          VERSION="v${VRAW}"
+          BRANCH_SAFE="${GITHUB_REF_NAME//\//-}"
+
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          REPO_LC=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+
+          TAG="${DATE}_${VERSION}_${BRANCH_SAFE}"
+          IMAGE_B="${REGISTRY}/${OWNER_LC}/${REPO_LC}-backend:${TAG}"
+          IMAGE_B_PROD="${REGISTRY}/${OWNER_LC}/${REPO_LC}-backend:prod-candidate_${TAG}"
+
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_B=$IMAGE_B" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_B_PROD=$IMAGE_B_PROD" >> "$GITHUB_OUTPUT"
+
+          echo "Computed:"
+          echo "  TAG: $TAG"
+          echo "  IMAGE_B: $IMAGE_B"
+          echo "  IMAGE_B_PROD: $IMAGE_B_PROD"
+
+      - name: Login to GHCR (runner)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push backend image
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          docker buildx create --use --name xbuilder || docker buildx use xbuilder
+          docker buildx build \
+            -f Dockerfile \
+            -t "${{ steps.meta.outputs.IMAGE_B }}" \
+            --push \
+            .
+
+      - name: Promote to prod-candidate tag (registry only; no deploy)
+        run: |
+          set -euo pipefail
+          docker pull "${{ steps.meta.outputs.IMAGE_B }}"
+          docker tag  "${{ steps.meta.outputs.IMAGE_B }}" "${{ steps.meta.outputs.IMAGE_B_PROD }}"
+          docker push "${{ steps.meta.outputs.IMAGE_B_PROD }}"
+
+  deploy_to_staging:
+    if: github.ref_name == 'restructure/monorepo'
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    environment: Staging   # your Staging environment with the secrets below
+
+    steps:
+      - name: Write SSH key (STAGING_SSH_KEY)
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          echo "${{ secrets.STAGING_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Add host to known_hosts (STAGING_SSH_HOST)
+        run: |
+          set -euo pipefail
+          ssh-keyscan -H "${{ secrets.STAGING_SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy backend container on staging VM (port 3001)
+        env:
+          # SSH
+          HOST:     ${{ secrets.STAGING_SSH_HOST }}
+          USER:     ${{ secrets.STAGING_SSH_USER }}
+
+          # GHCR creds for the REMOTE VM (prefer STAGING_GHCR_PAT if you add it)
+          CR_USER:  ${{ secrets.STAGING_GHCR_USER || github.actor }}
+          CR_PAT:   ${{ secrets.STAGING_GHCR_PAT || secrets.GHCR_PAT }}
+
+          # Image info
+          IMAGE_B:  ${{ needs.build_and_push.outputs.IMAGE_B }}
+          TAG:      ${{ needs.build_and_push.outputs.TAG }}
+
+          # DB secrets (staging)
+          DB_HOST:  ${{ secrets.DB_HOST_STAGING }}
+          DB_PORT:  ${{ secrets.DB_PORT_STAGING }}
+          DB_USER:  ${{ secrets.DB_USER_STAGING }}
+          DB_PASS:  ${{ secrets.DB_PASSWORD_STAGING }}
+          DB_NAME:  ${{ secrets.DB_NAME_STAGING }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CR_PAT}" ]; then
+            echo "Missing a GHCR token for the REMOTE VM."
+            echo "Please add STAGING_GHCR_PAT (preferred) or GHCR_PAT to the Staging environment."
+            exit 1
+          fi
+
+          echo "Connecting to ${USER}@${HOST} …"
+          ssh -i ~/.ssh/id_ed25519 "${USER}@${HOST}" bash -s -- <<EOF
+          set -euo pipefail
+
+          # Inject vars from the runner
+          CR_USER="${CR_USER}"
+          CR_PAT="${CR_PAT}"
+          IMAGE_B="${IMAGE_B}"
+          TAG="${TAG}"
+
+          DB_HOST="${DB_HOST}"
+          DB_PORT="${DB_PORT}"
+          DB_USER="${DB_USER}"
+          DB_PASS="${DB_PASS}"
+          DB_NAME="${DB_NAME}"
+
+          echo "Docker login to GHCR on remote…"
+          echo "\${CR_PAT}" | docker login ghcr.io -u "\${CR_USER}" --password-stdin
+
+          echo "Pull image: \${IMAGE_B}"
+          docker pull "\${IMAGE_B}"
+
+          NAME="stgContainer_\${TAG}"
+
+          echo "Stop/remove old container (if any)…"
+          docker rm -f "\${NAME}" 2>/dev/null || true
+
+          echo "Run new container on host port 3001 → container 3000…"
+          docker run -d --name "\${NAME}" \
+            -e DB_HOST="\${DB_HOST}" \
+            -e DB_PORT="\${DB_PORT}" \
+            -e DB_USER="\${DB_USER}" \
+            -e DB_PASSWORD="\${DB_PASS}" \
+            -e DB_NAME="\${DB_NAME}" \
+            -e PORT="3000" \
+            -p 3001:3000 \
+            "\${IMAGE_B}"
+
+          echo "Wait for /api/health on 127.0.0.1:3001 …"
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1:3001/api/health" >/dev/null 2>&1; then
+              echo "✅ Staging health OK at /api/health (port 3001)"
+              docker ps --filter "name=\${NAME}"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "❌ Staging health failed. Logs:"
+          docker logs --tail=200 "\${NAME}" || true
+          exit 1
+EOF
