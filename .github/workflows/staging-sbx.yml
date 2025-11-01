@@ -20,7 +20,11 @@ env:
 
 jobs:
   build_and_push:
-    if: github.ref_name == 'restructure/monorepo'
+    if: >
+      github.ref_name == 'restructure/monorepo' ||
+      github.ref_name == 'Development' ||
+      github.ref_name == 'Staging' ||
+      github.ref_name == 'Production'
     runs-on: ubuntu-latest
     outputs:
       IMAGE_BASE: ${{ steps.meta.outputs.IMAGE_BASE }}
