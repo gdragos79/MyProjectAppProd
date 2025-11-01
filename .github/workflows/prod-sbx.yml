@@ -27,7 +27,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  PKG_NAME: myprojectapp-backend
+  PKG_NAME: myprojectapp-backend        # image name used by Staging SBX
   PROD_PORT: "3000"
 
   # Proxy symlink + upstreams (you confirmed these)
@@ -93,9 +93,7 @@ jobs:
 
   pick_target:
     needs: resolve_image
-    runs-on:
-      - self-hosted
-      - proxy
+    runs-on: [self-hosted, proxy]
     outputs:
       active_color: ${{ steps.pick.outputs.active_color }}
       target_color: ${{ steps.pick.outputs.target_color }}
@@ -124,7 +122,7 @@ jobs:
           fi
 
           case "$TARGET" in
-            blue)  LABEL="app-blue" ;;
+            blue)  LABEL="app-blue"  ;;
             green) LABEL="app-green" ;;
           esac
 
@@ -134,9 +132,7 @@ jobs:
 
   deploy_to_target:
     needs: [resolve_image, pick_target]
-    runs-on:
-      - self-hosted
-      - ${{ needs.pick_target.outputs.target_label }}
+    runs-on: [self-hosted, ${{ needs.pick_target.outputs.target_label }}]
     environment: Production
     steps:
       - name: Info
@@ -164,19 +160,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # stop containers publishing ${PROD_PORT}
           CIDS=$(docker ps -q --filter "publish=${PROD_PORT}")
           if [ -n "$CIDS" ]; then
             echo "Stopping containers using port ${PROD_PORT}: $CIDS"
             docker rm -f $CIDS || true
           fi
-          # remove any older prod containers by label
           OLD=$(docker ps -a -q --filter "label=app=prod-backend")
           if [ -n "$OLD" ]; then
             echo "Removing old prod containers: $OLD"
             docker rm -f $OLD || true
           fi
-          # ensure port is free
           if ss -ltnp | grep -q ":${PROD_PORT} "; then
             echo "❌ Port ${PROD_PORT} still busy by non-Docker process:"
             ss -ltnp | grep ":${PROD_PORT} " || true
@@ -225,9 +218,7 @@ jobs:
 
   flip_proxy_and_soak:
     needs: [resolve_image, pick_target, deploy_to_target]
-    runs-on:
-      - self-hosted
-      - proxy
+    runs-on: [self-hosted, proxy]
     environment: Production
     steps:
       - name: Flip proxy symlink and reload Nginx
@@ -238,12 +229,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Resolve paths and files
           ACTIVE_LINK="${{ env.ACTIVE_LINK }}"
           BLUE_CONF="${{ env.BLUE_CONF }}"
           GREEN_CONF="${{ env.GREEN_CONF }}"
 
-          # Detect binaries (fallback to common paths)
+          # Detect binaries (fall back to common paths)
+          LN_BIN="$(command -v ln || echo /usr/bin/ln)"
           NGINX_BIN="$(command -v nginx || echo /usr/sbin/nginx)"
           SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
 
@@ -251,8 +242,7 @@ jobs:
           if [[ "$TARGET" == "blue" ]]; then NEW="$BLUE_CONF"; else NEW="$GREEN_CONF"; fi
 
           echo "Switching active to: $TARGET  ($NEW)"
-          # Use non-interactive sudo so it fails if NOPASSWD is not set
-          sudo -n /bin/ln -sfn "$NEW" "$ACTIVE_LINK"
+          sudo -n "$LN_BIN" -sfn "$NEW" "$ACTIVE_LINK"
           sudo -n "$NGINX_BIN" -t
           sudo -n "$SYSTEMCTL_BIN" reload nginx
 
@@ -298,10 +288,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$PREV" ] && [ -e "$PREV" ]; then
-            echo "Restoring previous active symlink to: $PREV"
-            sudo -n /bin/ln -sfn "$PREV" "${{ env.ACTIVE_LINK }}"
+            LN_BIN="$(command -v ln || echo /usr/bin/ln)"
             NGINX_BIN="$(command -v nginx || echo /usr/sbin/nginx)"
             SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
+            echo "Restoring previous active symlink to: $PREV"
+            sudo -n "$LN_BIN" -sfn "$PREV" "${{ env.ACTIVE_LINK }}"
             sudo -n "$NGINX_BIN" -t
             sudo -n "$SYSTEMCTL_BIN" reload nginx
           else
