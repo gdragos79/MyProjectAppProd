@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       BASE_TAG:
-        description: "Base tag to create (e.g. 01_11_2025_v0.8_restructure-monorepo)"
+        description: "Base tag to create (e.g. 01_11_2025_v0.9)"
         required: true
         type: string
 
@@ -14,9 +14,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # 👇 Keep this consistent with Production
   PKG_NAME: myprojectapp-backend
-  APP_DIR: apps/backend
   STAGING_PORT_HOST: "3001"   # host port on Staging VM
   CONTAINER_PORT: "3000"      # app listens inside container
 
@@ -27,6 +25,7 @@ jobs:
     outputs:
       IMAGE_BASE: ${{ steps.meta.outputs.IMAGE_BASE }}
       IMAGE_PC:   ${{ steps.meta.outputs.IMAGE_PC }}
+      NAMESPACE:  ${{ steps.meta.outputs.NAMESPACE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,8 +40,9 @@ jobs:
           BASE="${{ inputs.BASE_TAG }}"
           IMAGE_BASE="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:${BASE}"
           IMAGE_PC="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:prod-candidate_${BASE}"
-          echo "IMAGE_BASE=$IMAGE_BASE" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_PC=$IMAGE_PC"     >> "$GITHUB_OUTPUT"
+          echo "IMAGE_BASE=$IMAGE_BASE"   >> "$GITHUB_OUTPUT"
+          echo "IMAGE_PC=$IMAGE_PC"       >> "$GITHUB_OUTPUT"
+          echo "NAMESPACE=$OWNER_LC"      >> "$GITHUB_OUTPUT"
           echo "Base tag: $IMAGE_BASE"
           echo "Prod-candidate tag: $IMAGE_PC"
 
@@ -53,29 +53,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ✅ Force a docker-container builder so GHA cache works
+      # Use docker-container driver so GHA cache works
       - name: Set up Buildx (docker-container)
         uses: docker/setup-buildx-action@v3
         with:
-          version: latest
           driver: docker-container
           install: true
 
-      - name: Build & push both tags
+      - name: Sanity check paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la
+          echo "---- apps/backend ----"
+          ls -la apps/backend || true
+          test -f apps/backend/Dockerfile || { echo "Missing apps/backend/Dockerfile"; exit 1; }
+
+      - name: Build & push (base, prod-candidate, latest)
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile      # change if your Dockerfile is elsewhere
+          context: ./apps/backend
+          file: ./apps/backend/Dockerfile
           push: true
           build-args: |
             NODE_ENV=production
           tags: |
             ${{ steps.meta.outputs.IMAGE_BASE }}
             ${{ steps.meta.outputs.IMAGE_PC }}
-            ${{ env.REGISTRY }}/gdragos79/${{ env.PKG_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.NAMESPACE }}/${{ env.PKG_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false  # optional: avoids attestation noise
+          provenance: false
 
   deploy_staging:
     needs: build_and_push
@@ -89,7 +97,7 @@ jobs:
           echo "Runner: $(hostname)"
           docker --version || true
 
-      - name: Pull the prod-candidate image
+      - name: Pull prod-candidate image
         shell: bash
         env:
           IMAGE_PC: ${{ needs.build_and_push.outputs.IMAGE_PC }}
@@ -97,14 +105,14 @@ jobs:
           set -euo pipefail
           docker pull "$IMAGE_PC"
 
-      - name: Stop & remove any container using port ${{ env.STAGING_PORT_HOST }}
+      - name: Free port ${{ env.STAGING_PORT_HOST }} on staging
         shell: bash
         run: |
           set -euo pipefail
           CIDS=$(docker ps -q --filter "publish=${{ env.STAGING_PORT_HOST }}")
           if [ -n "$CIDS" ]; then docker rm -f $CIDS || true; fi
           if ss -ltnp | grep -q ":${{ env.STAGING_PORT_HOST }} "; then
-            echo "❌ Port ${{ env.STAGING_PORT_HOST }} is used by a non-Docker process:"
+            echo "❌ Port ${{ env.STAGING_PORT_HOST }} used by non-Docker process:"
             ss -ltnp | grep ":${{ env.STAGING_PORT_HOST }} " || true
             exit 1
           fi
@@ -133,7 +141,7 @@ jobs:
             "$IMAGE_PC"
           docker ps --filter "name=$NAME"
 
-      - name: Health check on Staging VM
+      - name: Health check on staging VM
         shell: bash
         run: |
           set -euo pipefail
