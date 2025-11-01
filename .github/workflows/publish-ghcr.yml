@@ -17,10 +17,14 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/myprojectapp
+  # Optional overrides (set in Settings → Variables → Repository variables)
+  FRONTEND_DIR_HINT: ${{ vars.FRONTEND_DIR }}
+  BACKEND_DIR_HINT:  ${{ vars.BACKEND_DIR }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,39 +44,60 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Debug layout
+      - name: Debug layout (top files + any Dockerfile)
         run: |
           echo "PWD=$PWD"
-          echo "WORKSPACE=${{ github.workspace }}"
-          echo "--- Top level ---"
           ls -la
-          echo "--- Dockerfiles (≤ depth 4) ---"
-          find . -maxdepth 4 -type f -name Dockerfile -print | sed 's#^\./##'
+          echo "---- Dockerfiles (any depth ≤ 8) ----"
+          find . -maxdepth 8 -type f \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' \) -print | sed 's#^\./##'
 
-      # -------------------
-      # Detect BACKEND dir
-      # -------------------
+      # ---------- BACKEND DETECT ----------
       - name: Detect backend dir
         id: detect_backend
         shell: bash
         run: |
           set -euo pipefail
-          found=""
-          # Easy wins by name
-          for d in ./backend ./Backend ./server ./api ./app/backend ./services/backend ./MyProjectAppProd/backend; do
-            if [ -f "$d/Dockerfile" ]; then found="$d"; break; fi
-          done
-          # Heuristic by regex if still not found
-          if [ -z "$found" ]; then
-            hit="$(find . -maxdepth 4 -type f -iname Dockerfile | grep -iE '/back[^/]*/Dockerfile' | head -n1 || true)"
-            if [ -n "$hit" ]; then found="$(dirname "$hit")"; fi
+          found="${BACKEND_DIR_HINT:-}"
+
+          # 1) Honor override if correct
+          if [[ -n "${found}" && -f "${found}/Dockerfile" ]]; then
+            echo "dir=$found" >> "$GITHUB_OUTPUT"
+            echo "Detected BACKEND (override): $found"
+            exit 0
           fi
-          if [ -z "$found" ]; then
-            echo "::error::Backend Dockerfile not found. See 'Debug layout' step."
+
+          # 2) Common names
+          for d in \
+            ./backend ./Backend ./server ./api \
+            ./app/backend ./services/backend ./apps/backend \
+            ./MyProjectAppProd/backend ./MyProjectAppProd-main/backend \
+            ./MyProjectAppProd*/backend
+          do
+            if [[ -f "$d/Dockerfile" ]]; then found="$d"; break; fi
+            # Also accept Dockerfile.*
+            if compgen -G "$d/Dockerfile.*" > /dev/null; then found="$d"; break; fi
+          done
+
+          # 3) Heuristic: path contains back|api|server and file name Dockerfile*
+          if [[ -z "$found" ]]; then
+            hit="$(find . -maxdepth 8 -type f \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' \) \
+              | grep -iE '/(back|api|server)[^/]*/Dockerfile(\..*)?$' | head -n1 || true)"
+            [[ -n "$hit" ]] && found="$(dirname "$hit")"
+          fi
+
+          # 4) Content hint: looks like Node/Express
+          if [[ -z "$found" ]]; then
+            hit="$(grep -RIl --include='Dockerfile*' -E 'node|npm (ci|install)|express' . | head -n1 || true)"
+            [[ -n "$hit" ]] && found="$(dirname "$hit")"
+          fi
+
+          if [[ -z "$found" ]]; then
+            echo "::error::Backend Dockerfile not found. Set repo variable BACKEND_DIR or ensure a Dockerfile exists."
             exit 1
           fi
+
           echo "dir=$found" >> "$GITHUB_OUTPUT"
-          echo "Detected BACKEND at: $found"
+          echo "Detected BACKEND: $found"
 
       - name: Build & push backend
         uses: docker/build-push-action@v6
@@ -88,30 +113,53 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
 
-      # -------------------
-      # Detect FRONTEND dir
-      # -------------------
+      # ---------- FRONTEND DETECT ----------
       - name: Detect frontend dir
         id: detect_frontend
         shell: bash
         run: |
           set -euo pipefail
-          found=""
-          # Common names
-          for d in ./frontend ./Frontend ./web ./client ./ui ./app/frontend ./apps/frontend ./MyProjectAppProd/frontend; do
-            if [ -f "$d/Dockerfile" ]; then found="$d"; break; fi
-          done
-          # Heuristic by regex if still not found
-          if [ -z "$found" ]; then
-            hit="$(find . -maxdepth 4 -type f -iname Dockerfile | grep -iE '/(front|web|client|ui)[^/]*/Dockerfile' | head -n1 || true)"
-            if [ -n "$hit" ]; then found="$(dirname "$hit")"; fi
+          found="${FRONTEND_DIR_HINT:-}"
+
+          # 1) Honor override if correct
+          if [[ -n "${found}" && -f "${found}/Dockerfile" ]]; then
+            echo "dir=$found" >> "$GITHUB_OUTPUT"
+            echo "Detected FRONTEND (override): $found"
+            exit 0
           fi
-          if [ -z "$found" ]; then
-            echo "::error::Frontend Dockerfile not found. See 'Debug layout' step."
+
+          # 2) Common names
+          for d in \
+            ./frontend ./Frontend ./web ./client ./ui \
+            ./app/frontend ./apps/frontend \
+            ./MyProjectAppProd/frontend ./MyProjectAppProd-main/frontend \
+            ./MyProjectAppProd*/frontend
+          do
+            if [[ -f "$d/Dockerfile" ]]; then found="$d"; break; fi
+            # Also accept Dockerfile.*
+            if compgen -G "$d/Dockerfile.*" > /dev/null; then found="$d"; break; fi
+          done
+
+          # 3) Heuristic: path contains front|web|client|ui and file name Dockerfile*
+          if [[ -z "$found" ]]; then
+            hit="$(find . -maxdepth 8 -type f \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' \) \
+              | grep -iE '/(front|web|client|ui)[^/]*/Dockerfile(\..*)?$' | head -n1 || true)"
+            [[ -n "$hit" ]] && found="$(dirname "$hit")"
+          fi
+
+          # 4) Content hint: typical React/Vite/Angular build
+          if [[ -z "$found" ]]; then
+            hit="$(grep -RIl --include='Dockerfile*' -E 'vite|react-scripts|ng build|npm run build' . | head -n1 || true)"
+            [[ -n "$hit" ]] && found="$(dirname "$hit")"
+          fi
+
+          if [[ -z "$found" ]]; then
+            echo "::error::Frontend Dockerfile not found. Set repo variable FRONTEND_DIR or ensure a Dockerfile exists."
             exit 1
           fi
+
           echo "dir=$found" >> "$GITHUB_OUTPUT"
-          echo "Detected FRONTEND at: $found"
+          echo "Detected FRONTEND: $found"
 
       - name: Build & push frontend
         uses: docker/build-push-action@v6
