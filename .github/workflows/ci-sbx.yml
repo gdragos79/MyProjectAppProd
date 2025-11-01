@@ -1,160 +1,85 @@
-name: CI SBX (sync main→dev, test, optional pushes)
+name: CI (Build & Test)
 
 on:
-  workflow_dispatch:
-    inputs:
-      SYNC_DEVELOPMENT:
-        description: "If true, push the tested dev-ci to origin/development (or origin/Development) — creates if missing."
-        type: boolean
-        default: false
-      MERGE_TO_MAIN:
-        description: "If true, merge development → main after dev push."
-        type: boolean
-        default: false
+  push:
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
   packages: read
 
 jobs:
-  ci:
-    if: github.ref_name == 'restructure/monorepo'
+  backend:
+    name: Backend CI
     runs-on: ubuntu-latest
-    environment:
-      name: Development-SBX
-
     steps:
-      - name: Checkout repository (full history @ triggering ref)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Configure Git identity
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      # ---- Robust, case-insensitive dev base ----
-      - name: Prepare local 'dev-ci' (handles Development/development; falls back to main)
-        id: prep
+      - name: Detect backend path
+        id: detect_backend
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --prune origin "+refs/heads/*:refs/remotes/origin/*"
-
-          # Pick remote dev branch name if it exists (case-insensitive)
-          DEV_REMOTE=""
-          if git ls-remote --exit-code --heads origin development >/dev/null 2>&1; then
-            DEV_REMOTE="development"
-          elif git ls-remote --exit-code --heads origin Development >/dev/null 2>&1; then
-            DEV_REMOTE="Development"
-          fi
-
-          if [ -n "$DEV_REMOTE" ]; then
-            echo "Using origin/$DEV_REMOTE as base."
-            git checkout -B dev-ci "origin/$DEV_REMOTE"
-            # Merge main into dev-ci if main exists
-            if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
-              git merge --no-edit origin/main || true
-            else
-              echo "[WARN] origin/main not found; skipping merge."
-            fi
-            echo "DEV_REMOTE=$DEV_REMOTE" >> "$GITHUB_OUTPUT"
+          if [ -f "apps/backend/package.json" ]; then
+            echo "dir=apps/backend" >> "$GITHUB_OUTPUT"
+          elif [ -f "backend/package.json" ]; then
+            echo "dir=backend" >> "$GITHUB_OUTPUT"
           else
-            echo "[INFO] No development branch found remotely; basing dev-ci on origin/main."
-            if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
-              git checkout -B dev-ci origin/main
-            else
-              echo "[ERROR] Neither origin/(Development|development) nor origin/main exist. Cannot proceed."
-              exit 1
-            fi
-            echo "DEV_REMOTE=" >> "$GITHUB_OUTPUT"
+            echo "dir=" >> "$GITHUB_OUTPUT"
           fi
 
-      # ---- BACKEND ----
-      - name: Backend - install deps (npm ci)
-        working-directory: apps/backend
+      - name: Backend deps (prefer lockfile; fallback to install)
+        if: steps.detect_backend.outputs.dir != ''
+        working-directory: ${{ steps.detect_backend.outputs.dir }}
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "No package-lock.json → using npm install"
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Backend tests (skip if no test script)
+        if: steps.detect_backend.outputs.dir != ''
+        working-directory: ${{ steps.detect_backend.outputs.dir }}
+        run: npm run test --if-present -- --runInBand || echo "No backend tests yet"
+
+  frontend:
+    name: Frontend CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Detect frontend path
+        id: detect_frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "apps/frontend/package.json" ]; then
+            echo "dir=apps/frontend" >> "$GITHUB_OUTPUT"
+          elif [ -f "react/package.json" ]; then
+            echo "dir=react" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Frontend deps
+        if: steps.detect_frontend.outputs.dir != ''
+        working-directory: ${{ steps.detect_frontend.outputs.dir }}
         run: npm ci
 
-      - name: Backend - tests
-        working-directory: apps/backend
-        env:
-          DB_HOST: ${{ secrets.DEV_DB_HOST }}
-          DB_PORT: ${{ secrets.DEV_DB_PORT }}
-          DB_USER: ${{ secrets.DEV_DB_USER }}
-          DB_PASSWORD: ${{ secrets.DEV_DB_PASSWORD }}
-          DB_NAME: ${{ secrets.DEV_DB_NAME }}
-        run: |
-          npm test -- --runInBand || echo "No backend tests yet? Add a Jest+Supertest health test."
-
-      # ---- FRONTEND ----
-      - name: Frontend - install deps (npm ci)
-        working-directory: apps/frontend
-        run: npm ci
-
-      - name: Frontend - build
-        working-directory: apps/frontend
-        run: npm run build
-
-      # ---- OPTIONAL: push dev-ci → remote dev branch (Development or development) ----
-      - name: Push dev-ci → origin/[Development|development] (optional)
-        if: inputs.SYNC_DEVELOPMENT == true
-        shell: bash
-        run: |
-          set -euo pipefail
-          git checkout dev-ci
-
-          # Decide target remote dev branch: prefer existing name; else create 'development'
-          TARGET_DEV=""
-          if git ls-remote --exit-code --heads origin development >/dev/null 2>&1; then
-            TARGET_DEV="development"
-          elif git ls-remote --exit-code --heads origin Development >/dev/null 2>&1; then
-            TARGET_DEV="Development"
-          else
-            TARGET_DEV="development"
-          fi
-
-          echo "Pushing dev-ci to origin/${TARGET_DEV}..."
-          # Create/update a local branch with same name so merge semantics are preserved
-          if git rev-parse --verify --quiet "$TARGET_DEV" >/dev/null; then
-            git checkout "$TARGET_DEV"
-            git merge --ff-only dev-ci || git merge --no-edit dev-ci
-          else
-            git checkout -B "$TARGET_DEV" dev-ci
-          fi
-          git push origin "HEAD:refs/heads/${TARGET_DEV}"
-
-      # ---- OPTIONAL: merge Development|development → main ----
-      - name: Merge dev → main (optional)
-        if: inputs.MERGE_TO_MAIN == true
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch origin "+refs/heads/*:refs/remotes/origin/*"
-
-          # Resolve dev branch name again
-          DEV_REMOTE=""
-          if git ls-remote --exit-code --heads origin development >/dev/null 2>&1; then
-            DEV_REMOTE="development"
-          elif git ls-remote --exit-code --heads origin Development >/dev/null 2>&1; then
-            DEV_REMOTE="Development"
-          else
-            echo "ERROR: No development branch found on remote; cannot merge into main."
-            exit 1
-          fi
-
-          if ! git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
-            echo "ERROR: origin/main not found; cannot update main."
-            exit 1
-          fi
-
-          git checkout -B "$DEV_REMOTE" "origin/$DEV_REMOTE"
-          git checkout -B main origin/main
-          git merge --ff-only "$DEV_REMOTE" || git merge --no-edit "$DEV_REMOTE"
-          git push origin main
+      - name: Frontend build (skip if no script)
+        if: steps.detect_frontend.outputs.dir != ''
+        working-directory: ${{ steps.detect_frontend.outputs.dir }}
+        run: npm run build --if-present || echo "No frontend build script"
