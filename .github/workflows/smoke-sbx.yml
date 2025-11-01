@@ -87,7 +87,7 @@ jobs:
           echo "---- package.json (scripts) ----"
           jq -r '.scripts // {}' package.json || cat package.json
 
-      - name: Start backend and wait for /api/health (Secrets DB, diagnostic)
+      - name: Start backend and discover health (Secrets DB; auto-detect entry/port/path)
         working-directory: apps/backend
         env:
           DB_HOST: ${{ secrets.SMOKE_DB_HOST }}
@@ -95,20 +95,18 @@ jobs:
           DB_USER: ${{ secrets.SMOKE_DB_USER }}
           DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
           DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
-          PORT: ${{ secrets.SMOKE_APP_PORT || '3000' }}
+          # NOTE: We do NOT set PORT here (avoid masked values). App should default or we detect actual port.
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "ENV summary:"
+          echo "ENV summary (external DB):"
           echo "  DB_HOST=$DB_HOST"
           echo "  DB_PORT=$DB_PORT"
           echo "  DB_USER=$DB_USER"
           echo "  DB_NAME=$DB_NAME"
-          echo "  APP PORT=$PORT (masked if from secrets)"
           echo
 
-          # Pick an entry file dynamically (index.js, server.js, app.js, src/index.js)
           ENTRY=""
           for f in index.js server.js app.js src/index.js; do
             if [ -f "$f" ]; then ENTRY="$f"; break; fi
@@ -121,11 +119,11 @@ jobs:
           fi
           echo "Using entry file: $ENTRY"
 
-          # Try starting with plain node first; if it dies, fallback to npm start if available
+          # Start backend (prefer plain node; fallback to npm start)
           set +e
-          node "$ENTRY" >/tmp/backend.log 2>&1 &
+          nohup node "$ENTRY" >/tmp/backend.log 2>&1 &
           NODE_PID=$!
-          sleep 1
+          sleep 2
           if ! ps -p "$NODE_PID" >/dev/null 2>&1; then
             echo "node $ENTRY did not stay running; trying npm start if present…"
             if npm run | grep -qE '^\s*start'; then
@@ -139,27 +137,29 @@ jobs:
           fi
           set -e
 
-          # Probe likely ports: $PORT, 3000, 3001
-          try_ports=("$PORT" "3000" "3001")
-
-          for i in {1..90}; do
-            for p in "${try_ports[@]}"; do
-              if curl -fsS "http://127.0.0.1:${p}/api/health" >/dev/null 2>&1; then
-                echo "✅ Health OK at /api/health on port ${p}"
-                exit 0
-              fi
+          # Probe for up to 120s:
+          # 1) discover real listening ports owned by node,
+          # 2) try /api/health and /health on each,
+          # 3) also try common fallbacks 3000/3001/8080
+          for i in {1..120}; do
+            CAND_PORTS=$(ss -ltnp 2>/dev/null | awk '/node/ {print $4}' | sed 's/.*://g' | sort -u | tr '\n' ' ')
+            TEST_PORTS="$CAND_PORTS 3000 3001 8080"
+            for p in $TEST_PORTS; do
+              for path in /api/health /health; do
+                if curl -fsS "http://127.0.0.1:${p}${path}" >/dev/null 2>&1; then
+                  echo "✅ Health OK at ${path} on port ${p}"
+                  exit 0
+                fi
+              done
             done
             sleep 1
           done
 
-          echo "❌ Health check failed after 90s."
-          echo "---- Last 200 lines of backend.log ----"
-          tail -n 200 /tmp/backend.log || true
+          echo "❌ Health check failed after 120s."
           echo "---- Listening ports (TCP) ----"
           ss -ltnp || true
-          echo "---- Node/npm versions ----"
-          node -v || true
-          npm -v || true
+          echo "---- Last 200 lines of backend.log ----"
+          tail -n 200 /tmp/backend.log || true
           exit 1
 
   # ------------------------------------------------------------
@@ -261,7 +261,7 @@ jobs:
           echo "---- package.json (scripts) ----"
           jq -r '.scripts // {}' package.json || cat package.json
 
-      - name: Start backend and wait for /api/health (Ephemeral DB via Secrets, diagnostic)
+      - name: Start backend and discover health (Ephemeral DB; auto-detect entry/port/path)
         working-directory: apps/backend
         env:
           DB_HOST: 127.0.0.1
@@ -269,17 +269,16 @@ jobs:
           DB_USER: ${{ secrets.SMOKE_DB_USER }}
           DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
           DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
-          PORT: ${{ secrets.SMOKE_APP_PORT || '3000' }}
           CONTAINER: sbx_pg_${{ github.run_id }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "ENV summary:"
+
+          echo "ENV summary (ephemeral DB):"
           echo "  DB_HOST=$DB_HOST"
           echo "  DB_PORT=$DB_PORT"
           echo "  DB_USER=$DB_USER"
           echo "  DB_NAME=$DB_NAME"
-          echo "  APP PORT=$PORT (masked if from secrets)"
           echo
 
           ENTRY=""
@@ -295,9 +294,9 @@ jobs:
           echo "Using entry file: $ENTRY"
 
           set +e
-          node "$ENTRY" >/tmp/backend.log 2>&1 &
+          nohup node "$ENTRY" >/tmp/backend.log 2>&1 &
           NODE_PID=$!
-          sleep 1
+          sleep 2
           if ! ps -p "$NODE_PID" >/dev/null 2>&1; then
             echo "node $ENTRY did not stay running; trying npm start if present…"
             if npm run | grep -qE '^\s*start'; then
@@ -311,24 +310,26 @@ jobs:
           fi
           set -e
 
-          try_ports=("$PORT" "3000" "3001")
-
-          for i in {1..90}; do
-            for p in "${try_ports[@]}"; do
-              if curl -fsS "http://127.0.0.1:${p}/api/health" >/dev/null 2>&1; then
-                echo "✅ Health OK at /api/health on port ${p}"
-                docker logs --tail=50 "$CONTAINER" || true
-                exit 0
-              fi
+          for i in {1..120}; do
+            CAND_PORTS=$(ss -ltnp 2>/dev/null | awk '/node/ {print $4}' | sed 's/.*://g' | sort -u | tr '\n' ' ')
+            TEST_PORTS="$CAND_PORTS 3000 3001 8080"
+            for p in $TEST_PORTS; do
+              for path in /api/health /health; do
+                if curl -fsS "http://127.0.0.1:${p}${path}" >/dev/null 2>&1; then
+                  echo "✅ Health OK at ${path} on port ${p}"
+                  docker logs --tail=50 "$CONTAINER" || true
+                  exit 0
+                fi
+              done
             done
             sleep 1
           done
 
-          echo "❌ Health check failed after 90s."
-          echo "---- Last 200 lines of backend.log ----"
-          tail -n 200 /tmp/backend.log || true
+          echo "❌ Health check failed after 120s."
           echo "---- Listening ports (TCP) ----"
           ss -ltnp || true
+          echo "---- Last 200 lines of backend.log ----"
+          tail -n 200 /tmp/backend.log || true
           echo "---- Postgres (ephemeral) last logs ----"
           docker logs --tail=200 "$CONTAINER" || true
           exit 1
