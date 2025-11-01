@@ -1,34 +1,30 @@
-# syntax=docker/dockerfile:1
-
-# --- Base image
+# -------- base image
 FROM node:20-alpine AS base
-WORKDIR /app
-
-# --- Install dependencies using backend's lockfile
-FROM base AS deps
-# copy ONLY backend's manifest files
-COPY backend/package*.json ./
-RUN npm ci
-
-# --- Runtime image
-FROM node:20-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Prisma engines & many libs need openssl on Alpine
-RUN apk add --no-cache openssl
+# -------- deps: install prod deps using lockfile if present
+FROM base AS deps
+# copy only package files first for better layer caching
+COPY package*.json ./
+# install only production deps (omit dev)
+RUN npm ci --omit=dev
 
-# bring in deps first for better layer caching
+# -------- runtime image
+FROM base AS runtime
+# optional: curl for healthcheck
+RUN apk add --no-cache curl
+# copy node_modules from deps
 COPY --from=deps /app/node_modules ./node_modules
+# now copy the backend source (context is ./backend)
+COPY . .
 
-# copy the backend source into the image
-COPY backend/. .
-
-# generate prisma client if present; no-op otherwise
-RUN npx prisma generate || true
-
-# adjust if your backend listens on a different port
-ENV PORT=3000
+# the app listens on 3000 (see index.js)
 EXPOSE 3000
 
-CMD ["node", "index.js"]
+# lightweight healthcheck hitting your /api/health endpoint
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:3000/api/health >/dev/null || exit 1
+
+# default command
+CMD ["npm","start"]
