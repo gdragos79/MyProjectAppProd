@@ -43,13 +43,20 @@ jobs:
       # 1) Prepare a local scratch branch = dev-ci
       - name: Create local dev-ci from origin/Development and merge origin/main
         run: |
-          set -e
-          git fetch origin main Development
-          # Start a local scratch branch from remote Development
-          git checkout -B dev-ci origin/Development
-          # Merge main into dev-ci (this is the "pull main into Development" step)
+          set -euo pipefail
+          git fetch origin --prune
+
+          # Prefer origin/Development; fallback to origin/main if missing
+          if git ls-remote --exit-code --heads origin Development >/dev/null 2>&1; then
+            echo "Using origin/Development as base…"
+            git checkout -B dev-ci origin/Development
+          else
+            echo "::warning::origin/Development not found; using origin/main as base."
+            git checkout -B dev-ci origin/main
+          fi
+
+          # Merge main into dev-ci (simulate 'pull main into Development')
           git merge --no-edit origin/main
-          # Stay on dev-ci for testing
 
       # 2) BACKEND: install, test
       - name: Backend - install deps (npm ci)
@@ -65,7 +72,6 @@ jobs:
           DB_PASSWORD: ${{ secrets.DEV_DB_PASSWORD }}
           DB_NAME: ${{ secrets.DEV_DB_NAME }}
         run: |
-          # If you haven't added tests yet, this will exit 0 but remind you to add them.
           npm test -- --runInBand || echo "No backend tests yet? Add a Jest+Supertest health test."
 
       # 3) FRONTEND: install, build
@@ -81,8 +87,8 @@ jobs:
       - name: Push dev-ci to origin/Development (optional)
         if: ${{ inputs.SYNC_DEVELOPMENT }}
         run: |
-          set -e
-          git checkout -B Development origin/Development
+          set -euo pipefail
+          git checkout -B Development origin/Development || git checkout -B Development dev-ci
           git merge --ff-only dev-ci || git merge --no-edit dev-ci
           git push --force-with-lease origin HEAD:Development
 
@@ -90,7 +96,7 @@ jobs:
       - name: Merge Development into main (optional)
         if: ${{ inputs.MERGE_TO_MAIN }}
         run: |
-          set -e
+          set -euo pipefail
           git checkout main
           git fetch origin Development
           git merge --ff-only origin/Development || git merge --no-edit origin/Development
