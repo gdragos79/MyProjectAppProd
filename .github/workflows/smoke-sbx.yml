@@ -1,0 +1,264 @@
+name: SBX Smoke (backend; secrets or ephemeral DB)
+
+on:
+  workflow_dispatch:
+    inputs:
+      USE_SECRETS_DB:
+        description: "Use external DB from GitHub Secrets (checked) or ephemeral Postgres (unchecked)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke_secrets:
+    if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB == true
+    name: Smoke (Secrets DB)
+    runs-on: ubuntu-latest
+    environment: Development-SBX
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required secrets (external DB)
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${{ secrets.SMOKE_DB_HOST }}" ] || missing+=("SMOKE_DB_HOST")
+          [ -n "${{ secrets.SMOKE_DB_USER }}" ] || missing+=("SMOKE_DB_USER")
+          [ -n "${{ secrets.SMOKE_DB_PASSWORD }}" ] || missing+=("SMOKE_DB_PASSWORD")
+          [ -n "${{ secrets.SMOKE_DB_NAME }}" ] || missing+=("SMOKE_DB_NAME")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install backend deps (ci→install fallback)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            if ! npm ci; then
+              echo "npm ci failed → falling back to npm install"
+              rm -f package-lock.json
+              npm install --no-audit --no-fund
+            fi
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Show backend layout (files + scripts)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "---- files ----"; ls -la
+          echo "---- package.json (scripts) ----"
+          jq -r '.scripts // {}' package.json || cat package.json
+
+      - name: Start backend and live-diagnose (Secrets DB; fixed PORT=3000)
+        working-directory: apps/backend
+        env:
+          DB_HOST: ${{ secrets.SMOKE_DB_HOST }}
+          DB_PORT: ${{ secrets.SMOKE_DB_PORT || '5432' }}
+          DB_USER: ${{ secrets.SMOKE_DB_USER }}
+          DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
+          PORT: "3000"
+          NODE_OPTIONS: "--unhandled-rejections=strict --trace-uncaught"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ENV summary (external DB):"
+          echo "  DB_HOST=$DB_HOST"
+          echo "  DB_PORT=$DB_PORT"
+          echo "  DB_USER=$DB_USER"
+          echo "  DB_NAME=$DB_NAME"
+          echo "  PORT=$PORT"
+          echo
+
+          ENTRY=""
+          for f in index.js server.js app.js src/index.js; do
+            if [ -f "$f" ]; then ENTRY="$f"; break; fi
+          done
+          if [ -z "$ENTRY" ]; then
+            echo "No backend entry file found."; ls -R; exit 1
+          fi
+          echo "Using entry file: $ENTRY"
+          echo "---- Begin $ENTRY ----"; sed -n '1,200p' "$ENTRY" || true; echo "---- End $ENTRY ----"
+
+          set +e
+          nohup node "$ENTRY" >/tmp/backend.log 2>&1 &
+          APP_PID=$!
+          set -e
+
+          ( for i in {1..60}; do echo "---- backend.log tick $i ----"; tail -n 50 /tmp/backend.log || true; sleep 2; done ) &
+          LOGGER_PID=$!
+
+          for i in {1..120}; do
+            CAND_PORTS=$(ss -ltnp 2>/dev/null | awk '/node/ {print $4}' | sed 's/.*://g' | sort -u | tr '\n' ' ')
+            TEST_PORTS="$CAND_PORTS 3000 3001 8080"
+            for p in $TEST_PORTS; do
+              for path in /api/health /health; do
+                if curl -fsS "http://127.0.0.1:${p}${path}" >/dev/null 2>&1; then
+                  echo "✅ Health OK at ${path} on port ${p}"
+                  kill "$LOGGER_PID" 2>/dev/null || true
+                  exit 0
+                fi
+              done
+            done
+            sleep 1
+          done
+
+          echo "❌ Health check failed after 120s."
+          echo "---- Listening ports (TCP) ----"; ss -ltnp || true
+          echo "---- Final backend.log tail ----"; tail -n 200 /tmp/backend.log || true
+          kill "$LOGGER_PID" 2>/devnull || true
+          exit 1
+
+  smoke_ephemeral:
+    if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB != true
+    name: Smoke (Ephemeral DB via Secrets)
+    runs-on: ubuntu-latest
+    environment: Development-SBX
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required secrets (ephemeral DB creds)
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${{ secrets.SMOKE_DB_USER }}" ] || missing+=("SMOKE_DB_USER")
+          [ -n "${{ secrets.SMOKE_DB_PASSWORD }}" ] || missing+=("SMOKE_DB_PASSWORD")
+          [ -n "${{ secrets.SMOKE_DB_NAME }}" ] || missing+=("SMOKE_DB_NAME")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Start ephemeral Postgres (docker) with secrets
+        env:
+          EP_DB_USER:     ${{ secrets.SMOKE_DB_USER }}
+          EP_DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
+          EP_DB_NAME:     ${{ secrets.SMOKE_DB_NAME }}
+          CONTAINER: sbx_pg_${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm -f "$CONTAINER" 2>/dev/null || true
+          docker run -d --name "$CONTAINER" -p 5432:5432 \
+            -e POSTGRES_USER="$EP_DB_USER" \
+            -e POSTGRES_PASSWORD="$EP_DB_PASSWORD" \
+            -e POSTGRES_DB="$EP_DB_NAME" \
+            postgres:15
+          echo "Waiting for Postgres to be ready…"
+          for i in {1..60}; do
+            if docker exec "$CONTAINER" pg_isready -U "$EP_DB_USER" -d "$EP_DB_NAME" >/dev/null 2>&1; then
+              echo "Ephemeral Postgres is ready."; break; fi; sleep 2; done
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install backend deps (ci→install fallback)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            if ! npm ci; then
+              echo "npm ci failed → falling back to npm install"
+              rm -f package-lock.json
+              npm install --no-audit --no-fund
+            fi
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Show backend layout (files + scripts)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "---- files ----"; ls -la
+          echo "---- package.json (scripts) ----"
+          jq -r '.scripts // {}' package.json || cat package.json
+
+      - name: Start backend and live-diagnose (Ephemeral DB; fixed PORT=3000)
+        working-directory: apps/backend
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_USER: ${{ secrets.SMOKE_DB_USER }}
+          DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.SMOKE_DB_NAME }}
+          PORT: "3000"
+          NODE_OPTIONS: "--unhandled-rejections=strict --trace-uncaught"
+          CONTAINER: sbx_pg_${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ENV summary (ephemeral DB):"
+          echo "  DB_HOST=$DB_HOST"
+          echo "  DB_PORT=$DB_PORT"
+          echo "  DB_USER=$DB_USER"
+          echo "  DB_NAME=$DB_NAME"
+          echo "  PORT=$PORT"
+          echo
+
+          ENTRY=""
+          for f in index.js server.js app.js src/index.js; do
+            if [ -f "$f" ]; then ENTRY="$f"; break; fi
+          done
+          if [ -z "$ENTRY" ]; then
+            echo "No backend entry file found."; ls -R; exit 1
+          fi
+          echo "Using entry file: $ENTRY"
+          echo "---- Begin $ENTRY ----"; sed -n '1,200p' "$ENTRY" || true; echo "---- End $ENTRY ----"
+
+          set +e
+          nohup node "$ENTRY" >/tmp/backend.log 2>&1 &
+          APP_PID=$!
+          set -e
+
+          ( for i in {1..60}; do echo "---- backend.log tick $i ----"; tail -n 50 /tmp/backend.log || true; sleep 2; done ) &
+          LOGGER_PID=$!
+
+          for i in {1..120}; do
+            CAND_PORTS=$(ss -ltnp 2>/dev/null | awk '/node/ {print $4}' | sed 's/.*://g' | sort -u | tr '\n' ' ')
+            TEST_PORTS="$CAND_PORTS 3000 3001 8080"
+            for p in $TEST_PORTS; do
+              for path in /api/health /health; do
+                if curl -fsS "http://127.0.0.1:${p}${path}" >/dev/null 2>&1; then
+                  echo "✅ Health OK at ${path} on port ${p}"
+                  docker logs --tail=50 "$CONTAINER" || true
+                  kill "$LOGGER_PID" 2>/dev/null || true
+                  exit 0
+                fi
+              done
+            done
+            sleep 1
+          done
+
+          echo "❌ Health check failed after 120s."
+          echo "---- Listening ports (TCP) ----"; ss -ltnp || true
+          echo "---- Final backend.log tail ----"; tail -n 200 /tmp/backend.log || true
+          echo "---- Postgres (ephemeral) last logs ----"; docker logs --tail=200 "$CONTAINER" || true
+          kill "$LOGGER_PID" 2>/dev/null || true
+          exit 1
+
+      - name: Cleanup ephemeral Postgres
+        if: always()
+        env:
+          CONTAINER: sbx_pg_${{ github.run_id }}
+        shell: bash
+        run: docker rm -f "$CONTAINER" 2>/dev/null || true

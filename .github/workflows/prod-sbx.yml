@@ -1,0 +1,309 @@
+name: "PROD SBX (blue/green deploy → flip proxy → soak → rollback)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      IMAGE_TAG_BASE:
+        description: "Base tag from Staging (e.g. 01_11_2025_v0.9). Tries prod-candidate_<tag> first, then <tag>."
+        type: string
+        required: true
+      TARGET_OVERRIDE:
+        description: "Force deploy color (otherwise auto-picks the inactive one)"
+        type: choice
+        default: auto
+        options: [auto, blue, green]
+      SOAK_SECONDS:
+        description: "Post-flip soak time (seconds)"
+        type: number
+        default: 600
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+  PKG_NAME: myprojectapp-backend         # must match the Staging push image name
+  PROD_PORT: "3000"
+
+  # Proxy symlink + upstreams
+  ACTIVE_LINK: "/etc/nginx/upstreams/active.conf"
+  BLUE_CONF:  "/etc/nginx/upstreams-available/upstream-blue.conf"
+  GREEN_CONF: "/etc/nginx/upstreams-available/upstream-green.conf"
+
+jobs:
+  resolve_image:
+    if: github.ref_name == 'restructure/monorepo'
+    runs-on: ubuntu-latest
+    outputs:
+      IMAGE_PULL: ${{ steps.choose.outputs.IMAGE_PULL }}
+      BASE_TAG:   ${{ steps.choose.outputs.BASE_TAG }}
+    steps:
+      - name: Compute candidate tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          BASE="${{ inputs.IMAGE_TAG_BASE }}"
+          echo "OWNER_LC=$OWNER_LC" >> "$GITHUB_OUTPUT"
+          echo "BASE=$BASE"         >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pick image (prod-candidate or base)
+        id: choose
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER_LC="${{ steps.meta.outputs.OWNER_LC }}"
+          BASE="${{ steps.meta.outputs.BASE }}"
+          IMG1="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:prod-candidate_${BASE}"
+          IMG2="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:${BASE}"
+
+          echo "Trying prod-candidate: $IMG1"
+          if docker pull "$IMG1" >/dev/null 2>&1; then
+            echo "IMAGE_PULL=$IMG1" >> "$GITHUB_OUTPUT"
+            echo "BASE_TAG=$BASE"   >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::prod-candidate not found; trying base tag… ($IMG2)"
+          if docker pull "$IMG2" >/dev/null 2>&1; then
+            echo "IMAGE_PULL=$IMG2" >> "$GITHUB_OUTPUT"
+            echo "BASE_TAG=$BASE"   >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Could not find either image:"
+          echo "  - $IMG1"
+          echo "  - $IMG2"
+          echo "Tip: verify Staging SBX pushed these tags and your IMAGE_TAG_BASE matches exactly."
+          exit 1
+
+  pick_target:
+    needs: resolve_image
+    runs-on:
+      - self-hosted
+      - proxy
+    outputs:
+      active_color: ${{ steps.pick.outputs.active_color }}
+      target_color: ${{ steps.pick.outputs.target_color }}
+      target_label: ${{ steps.pick.outputs.target_label }}
+    steps:
+      - name: Detect active color and choose target
+        id: pick
+        shell: bash
+        run: |
+          set -euo pipefail
+          CUR=$(readlink -f "${{ env.ACTIVE_LINK }}" || true)
+          if [[ "$CUR" == "${{ env.BLUE_CONF }}" ]] || echo "$CUR" | grep -qi "blue"; then
+            ACTIVE=blue
+          elif [[ "$CUR" == "${{ env.GREEN_CONF }}" ]] || echo "$CUR" | grep -qi "green"; then
+            ACTIVE=green
+          else
+            echo "::warning::Unknown active target ($CUR). Defaulting ACTIVE=blue."
+            ACTIVE=blue
+          fi
+
+          OV="${{ inputs.TARGET_OVERRIDE }}"
+          if [[ "$OV" == "blue" || "$OV" == "green" ]]; then
+            TARGET="$OV"
+          else
+            if [[ "$ACTIVE" == "blue" ]]; then TARGET="green"; else TARGET="blue"; fi
+          fi
+
+          case "$TARGET" in
+            blue)  LABEL="app-blue"  ;;
+            green) LABEL="app-green" ;;
+          esac
+
+          echo "active_color=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "target_color=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "target_label=$LABEL"  >> "$GITHUB_OUTPUT"
+
+  deploy_to_target:
+    needs: [resolve_image, pick_target]
+    runs-on:
+      - self-hosted
+      - ${{ needs.pick_target.outputs.target_label }}
+    environment: Production
+    steps:
+      - name: Info
+        shell: bash
+        run: |
+          echo "Runner: $(hostname)"
+          docker --version || true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull chosen image
+        shell: bash
+        env:
+          IMAGE: ${{ needs.resolve_image.outputs.IMAGE_PULL }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+
+      - name: Free port and remove old prod containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # stop containers publishing ${PROD_PORT}
+          CIDS=$(docker ps -q --filter "publish=${PROD_PORT}")
+          if [ -n "$CIDS" ]; then
+            echo "Stopping containers using port ${PROD_PORT}: $CIDS"
+            docker rm -f $CIDS || true
+          fi
+          # remove any older prod containers by label
+          OLD=$(docker ps -a -q --filter "label=app=prod-backend")
+          if [ -n "$OLD" ]; then
+            echo "Removing old prod containers: $OLD"
+            docker rm -f $OLD || true
+          fi
+          # ensure port is free
+          if ss -ltnp | grep -q ":${PROD_PORT} "; then
+            echo "❌ Port ${PROD_PORT} still busy by non-Docker process:"
+            ss -ltnp | grep ":${PROD_PORT} " || true
+            exit 1
+          fi
+
+      - name: Run new prod container
+        shell: bash
+        env:
+          IMAGE:   ${{ needs.resolve_image.outputs.IMAGE_PULL }}
+          BASE:    ${{ needs.resolve_image.outputs.BASE_TAG }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: |
+          set -euo pipefail
+          NAME="prodContainer_${BASE}"
+          docker run -d --name "$NAME" \
+            --label app=prod-backend \
+            -e DB_HOST="$DB_HOST" \
+            -e DB_PORT="$DB_PORT" \
+            -e DB_USER="$DB_USER" \
+            -e DB_PASSWORD="$DB_PASS" \
+            -e DB_NAME="$DB_NAME" \
+            -e PORT="3000" \
+            -p ${PROD_PORT}:3000 \
+            "$IMAGE"
+          docker ps --filter "name=$NAME"
+
+      - name: Local health check (pre-flip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..120}; do
+            if curl -fsS "http://127.0.0.1:${PROD_PORT}/api/health" >/dev/null 2>&1; then
+              echo "✅ Target VM backend healthy (pre-flip)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "❌ Target VM backend did not become healthy before flip."
+          docker logs --tail=200 $(docker ps -q --filter "label=app=prod-backend") || true
+          exit 1
+
+  flip_proxy_and_soak:
+    needs: [resolve_image, pick_target, deploy_to_target]
+    runs-on:
+      - self-hosted
+      - proxy
+    environment: Production
+    steps:
+      - name: Flip proxy symlink and reload Nginx
+        id: flip
+        shell: bash
+        env:
+          TARGET: ${{ needs.pick_target.outputs.target_color }}
+        run: |
+          set -euo pipefail
+          ACTIVE_LINK="${{ env.ACTIVE_LINK }}"
+          BLUE_CONF="${{ env.BLUE_CONF }}"
+          GREEN_CONF="${{ env.GREEN_CONF }}"
+
+          # Detect binaries (fallbacks included)
+          LN_BIN="$(command -v ln || echo /usr/bin/ln)"
+          NGINX_BIN="$(command -v nginx || echo /usr/sbin/nginx)"
+          SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
+
+          PREV="$(readlink -f "$ACTIVE_LINK" || true)"
+          if [[ "$TARGET" == "blue" ]]; then NEW="$BLUE_CONF"; else NEW="$GREEN_CONF"; fi
+
+          echo "Switching active to: $TARGET  ($NEW)"
+          sudo -n "$LN_BIN" -sfn "$NEW" "$ACTIVE_LINK"
+          sudo -n "$NGINX_BIN" -t
+          sudo -n "$SYSTEMCTL_BIN" reload nginx
+
+          echo "prev_target=$PREV" >> "$GITHUB_OUTPUT"
+
+      - name: Immediate proxy health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1/api/health" >/dev/null 2>&1; then
+              echo "✅ Proxy → backend health OK after flip."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "❌ Proxy health failed right after flip."
+          exit 1
+
+      - name: Soak and re-check via proxy
+        shell: bash
+        env:
+          SOAK: ${{ inputs.SOAK_SECONDS }}
+        run: |
+          set -euo pipefail
+          REM=$SOAK
+          echo "Soaking for $REM seconds with health sampling…"
+          while [ "$REM" -gt 0 ]; do
+            if ! curl -fsS "http://127.0.0.1/api/health" >/dev/null 2>&1; then
+              echo "❌ Health failed during soak. Triggering rollback…"
+              exit 42
+            fi
+            sleep 15
+            REM=$((REM-15))
+          done
+          echo "✅ Soak complete; health OK."
+
+      - name: Roll back proxy symlink (if soak failed)
+        if: failure()
+        shell: bash
+        env:
+          PREV: ${{ steps.flip.outputs.prev_target }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PREV" ] && [ -e "$PREV" ]; then
+            LN_BIN="$(command -v ln || echo /usr/bin/ln)"
+            NGINX_BIN="$(command -v nginx || echo /usr/sbin/nginx)"
+            SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
+            echo "Restoring previous active symlink to: $PREV"
+            sudo -n "$LN_BIN" -sfn "$PREV" "${{ env.ACTIVE_LINK }}"
+            sudo -n "$NGINX_BIN" -t
+            sudo -n "$SYSTEMCTL_BIN" reload nginx
+          else
+            echo "::warning::No previous target recorded; cannot rollback symlink."
+          fi
+          exit 1
