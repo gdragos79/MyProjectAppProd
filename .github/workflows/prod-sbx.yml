@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       IMAGE_TAG_BASE:
-        description: "Base tag from Staging (e.g. 01_11_2025_v0.8_restructure-monorepo). We'll pull prod-candidate_<tag> from GHCR."
+        description: "Base tag from Staging (e.g. 01_11_2025_v0.8_restructure-monorepo). Prefers prod-candidate_<BASE>, falls back to <BASE>."
         type: string
         required: true
       TARGET_OVERRIDE:
@@ -23,7 +23,7 @@ concurrency:
 
 permissions:
   contents: read
-  packages: read   # pull from GHCR with GITHUB_TOKEN
+  packages: read   # needed to pull from GHCR using GITHUB_TOKEN
 
 env:
   REGISTRY: ghcr.io
@@ -37,10 +37,10 @@ jobs:
     if: github.ref_name == 'restructure/monorepo'
     runs-on: ubuntu-latest
     outputs:
-      IMAGE_PULL: ${{ steps.meta.outputs.IMAGE_PULL }}
+      IMAGE_PULL: ${{ steps.choose.outputs.IMAGE_PULL }}
       BASE_TAG:   ${{ steps.meta.outputs.BASE_TAG }}
     steps:
-      - name: Compute image reference
+      - name: Compute candidate image names
         id: meta
         shell: bash
         run: |
@@ -49,11 +49,18 @@ jobs:
           REPO="${GITHUB_REPOSITORY#*/}"
           OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
           REPO_LC=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+
           BASE="${{ inputs.IMAGE_TAG_BASE }}"
-          IMAGE_PULL="${{ env.REGISTRY }}/${OWNER_LC}/${REPO_LC}-backend:prod-candidate_${BASE}"
-          echo "IMAGE_PULL=$IMAGE_PULL" >> "$GITHUB_OUTPUT"
-          echo "BASE_TAG=$BASE"        >> "$GITHUB_OUTPUT"
-          echo "Will pull: $IMAGE_PULL"
+
+          CAND1="${{ env.REGISTRY }}/${OWNER_LC}/${REPO_LC}-backend:prod-candidate_${BASE}"
+          CAND2="${{ env.REGISTRY }}/${OWNER_LC}/${REPO_LC}-backend:${BASE}"
+
+          echo "CAND1=$CAND1" >> "$GITHUB_OUTPUT"
+          echo "CAND2=$CAND2" >> "$GITHUB_OUTPUT"
+          echo "BASE_TAG=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Candidates (in order):"
+          echo "  1) $CAND1"
+          echo "  2) $CAND2"
 
       - name: Login to GHCR (for pull test)
         uses: docker/login-action@v3
@@ -62,20 +69,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate image exists
+      - name: Choose available image (prod-candidate first, else base)
+        id: choose
         shell: bash
         run: |
           set -euo pipefail
-          docker pull "${{ steps.meta.outputs.IMAGE_PULL }}"
-          echo "✅ Image is present in GHCR."
+          IMG1="${{ steps.meta.outputs.CAND1 }}"
+          IMG2="${{ steps.meta.outputs.CAND2 }}"
+
+          if docker pull "$IMG1" >/dev/null 2>&1; then
+            echo "Using IMAGE_PULL=$IMG1 (found prod-candidate tag)"
+            echo "IMAGE_PULL=$IMG1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::prod-candidate not found; trying base tag… ($IMG2)"
+          if docker pull "$IMG2" >/dev/null 2>&1; then
+            echo "Using IMAGE_PULL=$IMG2 (base tag)"
+            echo "IMAGE_PULL=$IMG2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Could not find either image:"
+          echo "  - $IMG1"
+          echo "  - $IMG2"
+          echo "Tip: ensure you typed IMAGE_TAG_BASE exactly as pushed in Staging."
+          exit 1
 
   pick_target:
     if: github.ref_name == 'restructure/monorepo'
     needs: resolve_image
     runs-on:
-      labels:
-        - self-hosted
-        - proxy
+      labels: [self-hosted, proxy]
     outputs:
       active_color: ${{ steps.pick.outputs.active_color }}
       target_color: ${{ steps.pick.outputs.target_color }}
@@ -118,9 +143,7 @@ jobs:
     if: github.ref_name == 'restructure/monorepo'
     needs: [resolve_image, pick_target]
     runs-on:
-      labels:
-        - self-hosted
-        - ${{ needs.pick_target.outputs.target_label }}
+      labels: [self-hosted, ${{ needs.pick_target.outputs.target_label }}]
     environment: Production
     steps:
       - name: Show runner info
@@ -217,9 +240,7 @@ jobs:
     if: github.ref_name == 'restructure/monorepo'
     needs: [resolve_image, pick_target, deploy_to_target]
     runs-on:
-      labels:
-        - self-hosted
-        - proxy
+      labels: [self-hosted, proxy]
     environment: Production
     steps:
       - name: Flip active.conf to target color and reload Nginx
