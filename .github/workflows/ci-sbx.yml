@@ -4,31 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       SYNC_DEVELOPMENT:
-        description: "If true, push the synced dev (after tests pass) back to origin/development."
+        description: "If true, push the tested dev-ci to origin/development (or origin/Development) — creates if missing."
         type: boolean
         default: false
       MERGE_TO_MAIN:
-        description: "If true, merge development → main (after dev push). Leave false for SBX."
+        description: "If true, merge development → main after dev push."
         type: boolean
         default: false
 
 permissions:
-  contents: write   # needed only if you ever toggle the push/merge inputs to true
+  contents: write
   packages: read
 
 jobs:
   ci:
-    # guard: only run from the test branch
     if: github.ref_name == 'restructure/monorepo'
     runs-on: ubuntu-latest
-    # use your sandbox environment (with DEV_* secrets)
     environment:
       name: Development-SBX
 
     steps:
-      - name: Checkout repository (full)
+      - name: Checkout repository (full history @ triggering ref)
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Set up Node.js 20
@@ -41,25 +40,44 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      # -----------------------------
-      # 1) Prepare a local scratch branch = dev-ci
-      #    Start from origin/development and merge origin/main into it (LOCAL ONLY).
-      #    This simulates "pull main into development" without pushing yet.
-      # -----------------------------
-      - name: Create local dev-ci from origin/development and merge origin/main
+      # ---- Robust, case-insensitive dev base ----
+      - name: Prepare local 'dev-ci' (handles Development/development; falls back to main)
+        id: prep
+        shell: bash
         run: |
-          set -e
-          git fetch origin main development
-          # Start a local scratch branch from remote development
-          git checkout -B dev-ci origin/development
-          # Merge main into dev-ci (this is the "pull main into development" step)
-          git merge --no-edit origin/main
-          # Stay on dev-ci for testing
+          set -euo pipefail
+          git fetch --prune origin "+refs/heads/*:refs/remotes/origin/*"
 
-      # -----------------------------
-      # 2) BACKEND: install, lint (optional), test
-      #    (Adjust scripts if needed)
-      # -----------------------------
+          # Pick remote dev branch name if it exists (case-insensitive)
+          DEV_REMOTE=""
+          if git ls-remote --exit-code --heads origin development >/dev/null 2>&1; then
+            DEV_REMOTE="development"
+          elif git ls-remote --exit-code --heads origin Development >/dev/null 2>&1; then
+            DEV_REMOTE="Development"
+          fi
+
+          if [ -n "$DEV_REMOTE" ]; then
+            echo "Using origin/$DEV_REMOTE as base."
+            git checkout -B dev-ci "origin/$DEV_REMOTE"
+            # Merge main into dev-ci if main exists
+            if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+              git merge --no-edit origin/main || true
+            else
+              echo "[WARN] origin/main not found; skipping merge."
+            fi
+            echo "DEV_REMOTE=$DEV_REMOTE" >> "$GITHUB_OUTPUT"
+          else
+            echo "[INFO] No development branch found remotely; basing dev-ci on origin/main."
+            if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+              git checkout -B dev-ci origin/main
+            else
+              echo "[ERROR] Neither origin/(Development|development) nor origin/main exist. Cannot proceed."
+              exit 1
+            fi
+            echo "DEV_REMOTE=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- BACKEND ----
       - name: Backend - install deps (npm ci)
         working-directory: apps/backend
         run: npm ci
@@ -73,12 +91,9 @@ jobs:
           DB_PASSWORD: ${{ secrets.DEV_DB_PASSWORD }}
           DB_NAME: ${{ secrets.DEV_DB_NAME }}
         run: |
-          # If you haven't added tests yet, this will exit 0 but remind you to add them.
           npm test -- --runInBand || echo "No backend tests yet? Add a Jest+Supertest health test."
 
-      # -----------------------------
-      # 3) FRONTEND: install, build (fail if it can’t build)
-      # -----------------------------
+      # ---- FRONTEND ----
       - name: Frontend - install deps (npm ci)
         working-directory: apps/frontend
         run: npm ci
@@ -87,27 +102,59 @@ jobs:
         working-directory: apps/frontend
         run: npm run build
 
-      # -----------------------------
-      # 4) OPTIONAL: push dev-ci → origin/development
-      #    This will actually update the real development branch, but only if you toggle SYNC_DEVELOPMENT=true.
-      # -----------------------------
-      - name: Push dev-ci to origin/development (optional)
+      # ---- OPTIONAL: push dev-ci → remote dev branch (Development or development) ----
+      - name: Push dev-ci → origin/[Development|development] (optional)
         if: inputs.SYNC_DEVELOPMENT == true
+        shell: bash
         run: |
-          set -e
-          # Fast-forward if possible; otherwise merge with a message
-          git checkout development || git checkout -b development
-          git merge --ff-only dev-ci || git merge --no-edit dev-ci
-          git push origin HEAD:development
+          set -euo pipefail
+          git checkout dev-ci
 
-      # -----------------------------
-      # 5) OPTIONAL: merge development → main (only if you also toggled MERGE_TO_MAIN=true)
-      # -----------------------------
-      - name: Merge development into main (optional)
+          # Decide target remote dev branch: prefer existing name; else create 'development'
+          TARGET_DEV=""
+          if git ls-remote --exit-code --heads origin development >/dev/null 2>&1; then
+            TARGET_DEV="development"
+          elif git ls-remote --exit-code --heads origin Development >/dev/null 2>&1; then
+            TARGET_DEV="Development"
+          else
+            TARGET_DEV="development"
+          fi
+
+          echo "Pushing dev-ci to origin/${TARGET_DEV}..."
+          # Create/update a local branch with same name so merge semantics are preserved
+          if git rev-parse --verify --quiet "$TARGET_DEV" >/dev/null; then
+            git checkout "$TARGET_DEV"
+            git merge --ff-only dev-ci || git merge --no-edit dev-ci
+          else
+            git checkout -B "$TARGET_DEV" dev-ci
+          fi
+          git push origin "HEAD:refs/heads/${TARGET_DEV}"
+
+      # ---- OPTIONAL: merge Development|development → main ----
+      - name: Merge dev → main (optional)
         if: inputs.MERGE_TO_MAIN == true
+        shell: bash
         run: |
-          set -e
-          git checkout main
-          git fetch origin development
-          git merge --ff-only origin/development || git merge --no-edit origin/development
+          set -euo pipefail
+          git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+
+          # Resolve dev branch name again
+          DEV_REMOTE=""
+          if git ls-remote --exit-code --heads origin development >/dev/null 2>&1; then
+            DEV_REMOTE="development"
+          elif git ls-remote --exit-code --heads origin Development >/dev/null 2>&1; then
+            DEV_REMOTE="Development"
+          else
+            echo "ERROR: No development branch found on remote; cannot merge into main."
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+            echo "ERROR: origin/main not found; cannot update main."
+            exit 1
+          fi
+
+          git checkout -B "$DEV_REMOTE" "origin/$DEV_REMOTE"
+          git checkout -B main origin/main
+          git merge --ff-only "$DEV_REMOTE" || git merge --no-edit "$DEV_REMOTE"
           git push origin main
