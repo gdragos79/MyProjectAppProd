@@ -11,8 +11,6 @@ on:
 permissions:
   contents: read
 
-# Run only when you trigger on the sandbox branch
-# (You can remove the 'if' checks below if you want to run on any branch.)
 jobs:
   # ------------------------------------------------------------
   # Job A: Use an EXTERNAL DB defined in GitHub Secrets
@@ -79,6 +77,16 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
+      - name: Show backend layout (files + scripts)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "---- files ----"
+          ls -la
+          echo "---- package.json (scripts) ----"
+          jq -r '.scripts // {}' package.json || cat package.json
+
       - name: Start backend and wait for /api/health (Secrets DB, diagnostic)
         working-directory: apps/backend
         env:
@@ -91,18 +99,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           echo "ENV summary:"
           echo "  DB_HOST=$DB_HOST"
           echo "  DB_PORT=$DB_PORT"
           echo "  DB_USER=$DB_USER"
           echo "  DB_NAME=$DB_NAME"
-          echo "  APP PORT=$PORT (masked if coming from secrets)"
+          echo "  APP PORT=$PORT (masked if from secrets)"
           echo
 
-          # Prefer plain node to avoid nodemon quirks in CI
-          (nohup node index.js >/tmp/backend.log 2>&1 &) || (nohup npm start >/tmp/backend.log 2>&1 &)
+          # Pick an entry file dynamically (index.js, server.js, app.js, src/index.js)
+          ENTRY=""
+          for f in index.js server.js app.js src/index.js; do
+            if [ -f "$f" ]; then ENTRY="$f"; break; fi
+          done
+          if [ -z "$ENTRY" ]; then
+            echo "No backend entry file found (index.js/server.js/app.js/src/index.js)."
+            echo "Listing tree for debugging:"
+            ls -R
+            exit 1
+          fi
+          echo "Using entry file: $ENTRY"
 
-          # Try likely ports: $PORT, 3000, 3001
+          # Try starting with plain node first; if it dies, fallback to npm start if available
+          set +e
+          node "$ENTRY" >/tmp/backend.log 2>&1 &
+          NODE_PID=$!
+          sleep 1
+          if ! ps -p "$NODE_PID" >/dev/null 2>&1; then
+            echo "node $ENTRY did not stay running; trying npm start if present…"
+            if npm run | grep -qE '^\s*start'; then
+              nohup npm start >/tmp/backend.log 2>&1 &
+            else
+              echo "No start script found and node failed to stay up." >&2
+              set -e
+              tail -n 200 /tmp/backend.log || true
+              exit 1
+            fi
+          fi
+          set -e
+
+          # Probe likely ports: $PORT, 3000, 3001
           try_ports=("$PORT" "3000" "3001")
 
           for i in {1..90}; do
@@ -214,6 +251,16 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
+      - name: Show backend layout (files + scripts)
+        working-directory: apps/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "---- files ----"
+          ls -la
+          echo "---- package.json (scripts) ----"
+          jq -r '.scripts // {}' package.json || cat package.json
+
       - name: Start backend and wait for /api/health (Ephemeral DB via Secrets, diagnostic)
         working-directory: apps/backend
         env:
@@ -232,10 +279,37 @@ jobs:
           echo "  DB_PORT=$DB_PORT"
           echo "  DB_USER=$DB_USER"
           echo "  DB_NAME=$DB_NAME"
-          echo "  APP PORT=$PORT (masked if coming from secrets)"
+          echo "  APP PORT=$PORT (masked if from secrets)"
           echo
 
-          (nohup node index.js >/tmp/backend.log 2>&1 &) || (nohup npm start >/tmp/backend.log 2>&1 &)
+          ENTRY=""
+          for f in index.js server.js app.js src/index.js; do
+            if [ -f "$f" ]; then ENTRY="$f"; break; fi
+          done
+          if [ -z "$ENTRY" ]; then
+            echo "No backend entry file found (index.js/server.js/app.js/src/index.js)."
+            echo "Listing tree for debugging:"
+            ls -R
+            exit 1
+          fi
+          echo "Using entry file: $ENTRY"
+
+          set +e
+          node "$ENTRY" >/tmp/backend.log 2>&1 &
+          NODE_PID=$!
+          sleep 1
+          if ! ps -p "$NODE_PID" >/dev/null 2>&1; then
+            echo "node $ENTRY did not stay running; trying npm start if present…"
+            if npm run | grep -qE '^\s*start'; then
+              nohup npm start >/tmp/backend.log 2>&1 &
+            else
+              echo "No start script found and node failed to stay up." >&2
+              set -e
+              tail -n 200 /tmp/backend.log || true
+              exit 1
+            fi
+          fi
+          set -e
 
           try_ports=("$PORT" "3000" "3001")
 
@@ -243,7 +317,6 @@ jobs:
             for p in "${try_ports[@]}"; do
               if curl -fsS "http://127.0.0.1:${p}/api/health" >/dev/null 2>&1; then
                 echo "✅ Health OK at /api/health on port ${p}"
-                # show a peek of DB logs (optional)
                 docker logs --tail=50 "$CONTAINER" || true
                 exit 0
               fi
