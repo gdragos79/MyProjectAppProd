@@ -27,10 +27,10 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  PKG_NAME: myprojectapp-backend     # must match Staging package name
+  PKG_NAME: myprojectapp-backend
   PROD_PORT: "3000"
 
-  # Proxy paths (you confirmed these)
+  # Proxy symlink + upstreams (you confirmed these)
   ACTIVE_LINK: "/etc/nginx/upstreams/active.conf"
   BLUE_CONF:  "/etc/nginx/upstreams-available/upstream-blue.conf"
   GREEN_CONF: "/etc/nginx/upstreams-available/upstream-green.conf"
@@ -112,7 +112,7 @@ jobs:
           elif [[ "$CUR" == "${{ env.GREEN_CONF }}" ]] || echo "$CUR" | grep -qi "green"; then
             ACTIVE=green
           else
-            echo "::warning::Unknown active symlink target ($CUR). Defaulting ACTIVE=blue."
+            echo "::warning::Unknown active target ($CUR). Defaulting ACTIVE=blue."
             ACTIVE=blue
           fi
 
@@ -164,7 +164,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # stop containers publishing the prod port
+          # stop containers publishing ${PROD_PORT}
           CIDS=$(docker ps -q --filter "publish=${PROD_PORT}")
           if [ -n "$CIDS" ]; then
             echo "Stopping containers using port ${PROD_PORT}: $CIDS"
@@ -237,12 +237,25 @@ jobs:
           TARGET: ${{ needs.pick_target.outputs.target_color }}
         run: |
           set -euo pipefail
-          PREV=$(readlink -f "${{ env.ACTIVE_LINK }}" || true)
-          if [[ "$TARGET" == "blue" ]]; then NEW="${{ env.BLUE_CONF }}"; else NEW="${{ env.GREEN_CONF }}"; fi
+
+          # Resolve paths and files
+          ACTIVE_LINK="${{ env.ACTIVE_LINK }}"
+          BLUE_CONF="${{ env.BLUE_CONF }}"
+          GREEN_CONF="${{ env.GREEN_CONF }}"
+
+          # Detect binaries (fallback to common paths)
+          NGINX_BIN="$(command -v nginx || echo /usr/sbin/nginx)"
+          SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
+
+          PREV="$(readlink -f "$ACTIVE_LINK" || true)"
+          if [[ "$TARGET" == "blue" ]]; then NEW="$BLUE_CONF"; else NEW="$GREEN_CONF"; fi
+
           echo "Switching active to: $TARGET  ($NEW)"
-          sudo ln -sfn "$NEW" "${{ env.ACTIVE_LINK }}"
-          sudo nginx -t
-          sudo systemctl reload nginx
+          # Use non-interactive sudo so it fails if NOPASSWD is not set
+          sudo -n /bin/ln -sfn "$NEW" "$ACTIVE_LINK"
+          sudo -n "$NGINX_BIN" -t
+          sudo -n "$SYSTEMCTL_BIN" reload nginx
+
           echo "prev_target=$PREV" >> "$GITHUB_OUTPUT"
 
       - name: Immediate proxy health check
@@ -286,9 +299,11 @@ jobs:
           set -euo pipefail
           if [ -n "$PREV" ] && [ -e "$PREV" ]; then
             echo "Restoring previous active symlink to: $PREV"
-            sudo ln -sfn "$PREV" "${{ env.ACTIVE_LINK }}"
-            sudo nginx -t
-            sudo systemctl reload nginx
+            sudo -n /bin/ln -sfn "$PREV" "${{ env.ACTIVE_LINK }}"
+            NGINX_BIN="$(command -v nginx || echo /usr/sbin/nginx)"
+            SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
+            sudo -n "$NGINX_BIN" -t
+            sudo -n "$SYSTEMCTL_BIN" reload nginx
           else
             echo "::warning::No previous target recorded; cannot rollback symlink."
           fi
