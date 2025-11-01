@@ -1,4 +1,4 @@
-name: PROD SBX (blue/green deploy → flip proxy → soak → rollback)
+name: PROD SBX (blue/green deploy -> flip proxy -> soak -> rollback)
 
 on:
   workflow_dispatch:
@@ -17,7 +17,6 @@ on:
         type: number
         default: 600
 
-# Prevent overlapping Production deploys (don’t cancel a running soak)
 concurrency:
   group: production-deploy
   cancel-in-progress: false
@@ -34,7 +33,6 @@ env:
   GREEN_CONF: /etc/nginx/upstreams-available/upstream-green.conf
 
 jobs:
-  # Figure out the exact image tag to pull and verify it exists in GHCR
   resolve_image:
     if: github.ref_name == 'restructure/monorepo'
     runs-on: ubuntu-latest
@@ -71,11 +69,13 @@ jobs:
           docker pull "${{ steps.meta.outputs.IMAGE_PULL }}"
           echo "✅ Image is present in GHCR."
 
-  # Run on the PROXY VM to detect active color (via active.conf symlink) and decide target color
   pick_target:
     if: github.ref_name == 'restructure/monorepo'
     needs: resolve_image
-    runs-on: [self-hosted, proxy]
+    runs-on:
+      labels:
+        - self-hosted
+        - proxy
     outputs:
       active_color: ${{ steps.pick.outputs.active_color }}
       target_color: ${{ steps.pick.outputs.target_color }}
@@ -90,7 +90,6 @@ jobs:
           BLUE_CONF="${{ env.BLUE_CONF }}"
           GREEN_CONF="${{ env.GREEN_CONF }}"
 
-          # Determine active by resolving symlink
           CUR=$(readlink -f "$ACTIVE_LINK" || true)
           if [[ "$CUR" == "$BLUE_CONF" ]] || echo "$CUR" | grep -qi "blue"; then
             ACTIVE=blue
@@ -101,7 +100,6 @@ jobs:
             ACTIVE=blue
           fi
 
-          # Decide target (override wins; otherwise choose the inactive color)
           OVERRIDE="${{ inputs.TARGET_OVERRIDE }}"
           if [[ "$OVERRIDE" == "blue" || "$OVERRIDE" == "green" ]]; then
             TARGET="$OVERRIDE"
@@ -116,11 +114,13 @@ jobs:
           echo "target_color=$TARGET" >> "$GITHUB_OUTPUT"
           echo "target_label=$TARGET" >> "$GITHUB_OUTPUT"
 
-  # Deploy to the INACTIVE color VM using its self-hosted runner (label: blue or green)
   deploy_to_target:
     if: github.ref_name == 'restructure/monorepo'
     needs: [resolve_image, pick_target]
-    runs-on: [self-hosted, ${{ needs.pick_target.outputs.target_label }}]
+    runs-on:
+      labels:
+        - self-hosted
+        - ${{ needs.pick_target.outputs.target_label }}
     environment: Production
     steps:
       - name: Show runner info
@@ -137,7 +137,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-        # GITHUB_TOKEN is provided automatically
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull image
         shell: bash
@@ -172,7 +172,7 @@ jobs:
             docker rm -f $OLD || true
           fi
 
-      - name: Run new container (host ${{ env.PROD_PORT }} → container 3000)
+      - name: Run new container (host ${{ env.PROD_PORT }} -> container 3000)
         shell: bash
         env:
           IMAGE:   ${{ needs.resolve_image.outputs.IMAGE_PULL }}
@@ -213,11 +213,13 @@ jobs:
           docker logs --tail=200 $(docker ps -q --filter "label=app=prod-backend") || true
           exit 1
 
-  # Flip the proxy to the new color, soak, and rollback on failure
   flip_proxy_and_soak:
     if: github.ref_name == 'restructure/monorepo'
     needs: [resolve_image, pick_target, deploy_to_target]
-    runs-on: [self-hosted, proxy]
+    runs-on:
+      labels:
+        - self-hosted
+        - proxy
     environment: Production
     steps:
       - name: Flip active.conf to target color and reload Nginx
@@ -251,7 +253,7 @@ jobs:
           set -euo pipefail
           for i in {1..60}; do
             if curl -fsS "http://127.0.0.1/api/health" >/dev/null 2>&1; then
-              echo "✅ Proxy → backend health OK after flip."
+              echo "✅ Proxy -> backend health OK after flip."
               exit 0
             fi
             sleep 2
