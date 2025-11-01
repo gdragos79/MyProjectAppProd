@@ -3,75 +3,126 @@ name: Publish images to GHCR
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch: {}
+
+concurrency:
+  group: publish-ghcr
+  cancel-in-progress: false
 
 permissions:
   contents: read
   packages: write
   id-token: write
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/myprojectapp
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # IMPORTANT: do NOT set "path:" here. Leave it at workspace root.
-
-      - name: Show layout (debug)
-        run: |
-          echo "PWD=$PWD"
-          ls -la
-          echo "---- backend ----"
-          ls -la backend || true
-          echo "---- frontend ----"
-          ls -la frontend || true
 
       - name: Set SHORT_SHA
         run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Backend
+      - name: Debug layout
+        run: |
+          echo "PWD=$PWD"
+          echo "WORKSPACE=${{ github.workspace }}"
+          echo "--- Top level ---"
+          ls -la
+          echo "--- Dockerfiles (≤ depth 4) ---"
+          find . -maxdepth 4 -type f -name Dockerfile -print | sed 's#^\./##'
+
+      # -------------------
+      # Detect BACKEND dir
+      # -------------------
+      - name: Detect backend dir
+        id: detect_backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=""
+          # Easy wins by name
+          for d in ./backend ./Backend ./server ./api ./app/backend ./services/backend ./MyProjectAppProd/backend; do
+            if [ -f "$d/Dockerfile" ]; then found="$d"; break; fi
+          done
+          # Heuristic by regex if still not found
+          if [ -z "$found" ]; then
+            hit="$(find . -maxdepth 4 -type f -iname Dockerfile | grep -iE '/back[^/]*/Dockerfile' | head -n1 || true)"
+            if [ -n "$hit" ]; then found="$(dirname "$hit")"; fi
+          fi
+          if [ -z "$found" ]; then
+            echo "::error::Backend Dockerfile not found. See 'Debug layout' step."
+            exit 1
+          fi
+          echo "dir=$found" >> "$GITHUB_OUTPUT"
+          echo "Detected BACKEND at: $found"
+
       - name: Build & push backend
         uses: docker/build-push-action@v6
         with:
-          context: ${{ github.workspace }}/backend
-          file: ${{ github.workspace }}/backend/Dockerfile
+          context: ${{ steps.detect_backend.outputs.dir }}
+          file: ${{ steps.detect_backend.outputs.dir }}/Dockerfile
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/myprojectapp-backend:latest
-            ghcr.io/${{ github.repository_owner }}/myprojectapp-backend:sha-${{ env.SHORT_SHA }}
+            ${{ env.IMAGE_PREFIX }}-backend:latest
+            ${{ env.IMAGE_PREFIX }}-backend:sha-${{ env.SHORT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
 
-      # Frontend
+      # -------------------
+      # Detect FRONTEND dir
+      # -------------------
+      - name: Detect frontend dir
+        id: detect_frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=""
+          # Common names
+          for d in ./frontend ./Frontend ./web ./client ./ui ./app/frontend ./apps/frontend ./MyProjectAppProd/frontend; do
+            if [ -f "$d/Dockerfile" ]; then found="$d"; break; fi
+          done
+          # Heuristic by regex if still not found
+          if [ -z "$found" ]; then
+            hit="$(find . -maxdepth 4 -type f -iname Dockerfile | grep -iE '/(front|web|client|ui)[^/]*/Dockerfile' | head -n1 || true)"
+            if [ -n "$hit" ]; then found="$(dirname "$hit")"; fi
+          fi
+          if [ -z "$found" ]; then
+            echo "::error::Frontend Dockerfile not found. See 'Debug layout' step."
+            exit 1
+          fi
+          echo "dir=$found" >> "$GITHUB_OUTPUT"
+          echo "Detected FRONTEND at: $found"
+
       - name: Build & push frontend
         uses: docker/build-push-action@v6
         with:
-          context: ${{ github.workspace }}/frontend
-          file: ${{ github.workspace }}/frontend/Dockerfile
+          context: ${{ steps.detect_frontend.outputs.dir }}
+          file: ${{ steps.detect_frontend.outputs.dir }}/Dockerfile
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/myprojectapp-frontend:latest
-            ghcr.io/${{ github.repository_owner }}/myprojectapp-frontend:sha-${{ env.SHORT_SHA }}
+            ${{ env.IMAGE_PREFIX }}-frontend:latest
+            ${{ env.IMAGE_PREFIX }}-frontend:sha-${{ env.SHORT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
