@@ -1,19 +1,19 @@
-name: PROD SBX (blue/green deploy -> flip proxy -> soak -> rollback)
+name: PROD SBX (blue/green deploy → flip proxy → soak → rollback)
 
 on:
   workflow_dispatch:
     inputs:
       IMAGE_TAG_BASE:
-        description: "Base tag from Staging (e.g. 01_11_2025_v0.8_restructure-monorepo). Prefers prod-candidate_<BASE>, falls back to <BASE>."
+        description: "Base tag from Staging (e.g. 01_11_2025_v0.9). Prod will try prod-candidate_<tag> first, then <tag>."
         type: string
         required: true
       TARGET_OVERRIDE:
-        description: "Force deploy to a color (otherwise auto-picks the inactive color)"
+        description: "Force deploy color (otherwise auto-picks the inactive one)"
         type: choice
         default: auto
         options: [auto, blue, green]
       SOAK_SECONDS:
-        description: "Soak time after flip (seconds, default 600 = 10 minutes)"
+        description: "Post-flip soak time (seconds)"
         type: number
         default: 600
 
@@ -23,11 +23,14 @@ concurrency:
 
 permissions:
   contents: read
-  packages: read   # needed to pull from GHCR using GITHUB_TOKEN
+  packages: read
 
 env:
   REGISTRY: ghcr.io
-  PROD_PORT: "3000"   # backend listens on 3000 on Blue/Green; proxy forwards to the active VM:3000
+  PKG_NAME: myprojectapp-backend      # ← match Staging SBX
+  PROD_PORT: "3000"                   # backend listens on 3000; proxy points to VM:3000
+
+  # Proxy paths (you confirmed these)
   ACTIVE_LINK: /etc/nginx/upstreams/active.conf
   BLUE_CONF:  /etc/nginx/upstreams-available/upstream-blue.conf
   GREEN_CONF: /etc/nginx/upstreams-available/upstream-green.conf
@@ -37,120 +40,96 @@ jobs:
     if: github.ref_name == 'restructure/monorepo'
     runs-on: ubuntu-latest
     outputs:
-      IMAGE_PULL: ${{ steps.choose.outputs.IMAGE_PULL }}
-      BASE_TAG:   ${{ steps.meta.outputs.BASE_TAG }}
+      IMAGE_PULL: ${{ steps.pick.outputs.IMAGE_PULL }}
+      BASE_TAG:   ${{ steps.pick.outputs.BASE_TAG }}
     steps:
-      - name: Compute candidate image names
-        id: meta
+      - name: Compute & pick image
+        id: pick
         shell: bash
         run: |
           set -euo pipefail
           OWNER="${GITHUB_REPOSITORY%/*}"
-          REPO="${GITHUB_REPOSITORY#*/}"
           OWNER_LC=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
-          REPO_LC=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
-
           BASE="${{ inputs.IMAGE_TAG_BASE }}"
-
-          CAND1="${{ env.REGISTRY }}/${OWNER_LC}/${REPO_LC}-backend:prod-candidate_${BASE}"
-          CAND2="${{ env.REGISTRY }}/${OWNER_LC}/${REPO_LC}-backend:${BASE}"
-
-          echo "CAND1=$CAND1" >> "$GITHUB_OUTPUT"
-          echo "CAND2=$CAND2" >> "$GITHUB_OUTPUT"
-          echo "BASE_TAG=$BASE" >> "$GITHUB_OUTPUT"
-          echo "Candidates (in order):"
-          echo "  1) $CAND1"
-          echo "  2) $CAND2"
-
-      - name: Login to GHCR (for pull test)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Choose available image (prod-candidate first, else base)
-        id: choose
-        shell: bash
-        run: |
-          set -euo pipefail
-          IMG1="${{ steps.meta.outputs.CAND1 }}"
-          IMG2="${{ steps.meta.outputs.CAND2 }}"
-
+          IMG1="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:prod-candidate_${BASE}"
+          IMG2="${{ env.REGISTRY }}/${OWNER_LC}/${{ env.PKG_NAME }}:${BASE}"
+          echo "Trying to pull: $IMG1 …"
           if docker pull "$IMG1" >/dev/null 2>&1; then
-            echo "Using IMAGE_PULL=$IMG1 (found prod-candidate tag)"
+            echo "Using IMAGE_PULL=$IMG1"
             echo "IMAGE_PULL=$IMG1" >> "$GITHUB_OUTPUT"
+            echo "BASE_TAG=$BASE"   >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "::warning::prod-candidate not found; trying base tag… ($IMG2)"
           if docker pull "$IMG2" >/dev/null 2>&1; then
-            echo "Using IMAGE_PULL=$IMG2 (base tag)"
+            echo "Using IMAGE_PULL=$IMG2"
             echo "IMAGE_PULL=$IMG2" >> "$GITHUB_OUTPUT"
+            echo "BASE_TAG=$BASE"   >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "::error::Could not find either image:"
           echo "  - $IMG1"
           echo "  - $IMG2"
-          echo "Tip: ensure you typed IMAGE_TAG_BASE exactly as pushed in Staging."
+          echo "Tip: verify Staging SBX pushed these tags and the BASE value is exact."
           exit 1
 
   pick_target:
-    if: github.ref_name == 'restructure/monorepo'
     needs: resolve_image
     runs-on: [self-hosted, proxy]
     outputs:
       active_color: ${{ steps.pick.outputs.active_color }}
       target_color: ${{ steps.pick.outputs.target_color }}
+      target_label: ${{ steps.pick.outputs.target_label }} # maps to runner labels
     steps:
-      - name: Detect active color (proxy)
+      - name: Detect active color via proxy symlink and choose target
         id: pick
         shell: bash
         run: |
           set -euo pipefail
-          ACTIVE_LINK="${{ env.ACTIVE_LINK }}"
-          BLUE_CONF="${{ env.BLUE_CONF }}"
-          GREEN_CONF="${{ env.GREEN_CONF }}"
-
-          CUR=$(readlink -f "$ACTIVE_LINK" || true)
-          if [[ "$CUR" == "$BLUE_CONF" ]] || echo "$CUR" | grep -qi "blue"; then
+          CUR=$(readlink -f "${{ env.ACTIVE_LINK }}" || true)
+          if [[ "$CUR" == "${{ env.BLUE_CONF }}" ]] || echo "$CUR" | grep -qi "blue"; then
             ACTIVE=blue
-          elif [[ "$CUR" == "$GREEN_CONF" ]] || echo "$CUR" | grep -qi "green"; then
+          elif [[ "$CUR" == "${{ env.GREEN_CONF }}" ]] || echo "$CUR" | grep -qi "green"; then
             ACTIVE=green
           else
-            echo "::warning::Could not infer active color from $ACTIVE_LINK ($CUR). Defaulting ACTIVE=blue."
+            echo "::warning::Unknown active symlink target ($CUR). Defaulting ACTIVE=blue."
             ACTIVE=blue
           fi
 
-          OVERRIDE="${{ inputs.TARGET_OVERRIDE }}"
-          if [[ "$OVERRIDE" == "blue" || "$OVERRIDE" == "green" ]]; then
-            TARGET="$OVERRIDE"
+          # auto pick opposite unless override provided
+          OV="${{ inputs.TARGET_OVERRIDE }}"
+          if [[ "$OV" == "blue" || "$OV" == "green" ]]; then
+            TARGET="$OV"
           else
             if [[ "$ACTIVE" == "blue" ]]; then TARGET="green"; else TARGET="blue"; fi
           fi
 
+          # map color -> runner label names in your repo
+          case "$TARGET" in
+            blue)  LABEL="app-blue" ;;
+            green) LABEL="app-green" ;;
+          esac
+
           echo "Active: $ACTIVE"
-          echo "Target: $TARGET (override=${OVERRIDE})"
+          echo "Target: $TARGET (runner label: $LABEL)"
 
           echo "active_color=$ACTIVE" >> "$GITHUB_OUTPUT"
           echo "target_color=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "target_label=$LABEL"  >> "$GITHUB_OUTPUT"
 
-  # ----- Deploy to BLUE (only if target_color == 'blue') -----
-  deploy_blue:
-    if: github.ref_name == 'restructure/monorepo' && needs.pick_target.outputs.target_color == 'blue'
+  deploy_to_target:
     needs: [resolve_image, pick_target]
-    runs-on: [self-hosted, blue]
+    runs-on: [self-hosted, ${{ needs.pick_target.outputs.target_label }}]
     environment: Production
     steps:
       - name: Show runner info
         shell: bash
         run: |
           set -euo pipefail
-          echo "Runner: $(hostname) / $(uname -a)"
+          echo "Runner: $(hostname)"
           docker --version || true
-          which docker || true
-          which curl || (sudo apt-get update -y && sudo apt-get install -y curl)
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -159,7 +138,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull image
+      - name: Pull chosen image
         shell: bash
         env:
           IMAGE: ${{ needs.resolve_image.outputs.IMAGE_PULL }}
@@ -167,32 +146,30 @@ jobs:
           set -euo pipefail
           docker pull "$IMAGE"
 
-      - name: Free host port ${{ env.PROD_PORT }} if used
+      - name: Free host port ${{ env.PROD_PORT }} (and remove any existing prod containers)
         shell: bash
         run: |
           set -euo pipefail
+          # stop anything already publishing this port
           CIDS=$(docker ps -q --filter "publish=${{ env.PROD_PORT }}")
           if [ -n "$CIDS" ]; then
-            echo "Port ${{ env.PROD_PORT }} is in use by container(s): $CIDS — stopping…"
+            echo "Stopping containers using port ${{ env.PROD_PORT }}: $CIDS"
             docker rm -f $CIDS || true
           fi
-          if ss -ltnp | grep -q ":${{ env.PROD_PORT }} "; then
-            echo "❌ Port ${{ env.PROD_PORT }} still busy (non-Docker process):"
-            ss -ltnp | grep ":${{ env.PROD_PORT }} " || true
-            exit 1
-          fi
-
-      - name: Remove old prod containers (optional cleanup)
-        shell: bash
-        run: |
-          set -euo pipefail
-          OLD=$(docker ps -a --filter "name=^prodContainer_" -q)
+          # clean previous prod containers by label
+          OLD=$(docker ps -a -q --filter "label=app=prod-backend")
           if [ -n "$OLD" ]; then
             echo "Removing old prod containers: $OLD"
             docker rm -f $OLD || true
           fi
+          # ensure port is really free
+          if ss -ltnp | grep -q ":${{ env.PROD_PORT }} "; then
+            echo "❌ Port ${{ env.PROD_PORT }} still busy by non-Docker process:"
+            ss -ltnp | grep ":${{ env.PROD_PORT }} " || true
+            exit 1
+          fi
 
-      - name: Run new container (host ${{ env.PROD_PORT }} -> container 3000)
+      - name: Run new prod container
         shell: bash
         env:
           IMAGE:   ${{ needs.resolve_image.outputs.IMAGE_PULL }}
@@ -215,104 +192,6 @@ jobs:
             -e PORT="3000" \
             -p ${PROD_PORT}:3000 \
             "$IMAGE"
-          echo "Started: $NAME"
-          docker ps --filter "name=$NAME"
-
-      - name: Local health check on target VM (pre-flip)
-        shell: bash
-        run: |
-          set -euo pipefail
-          for i in {1..120}; do
-            if curl -fsS "http://127.0.0.1:${PROD_PORT}/api/health" >/dev/null 2>&1; then
-              echo "✅ Target VM backend healthy (pre-flip)."
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "❌ Target VM backend did not become healthy before flip."
-          docker logs --tail=200 $(docker ps -q --filter "label=app=prod-backend") || true
-          exit 1
-
-  # ----- Deploy to GREEN (only if target_color == 'green') -----
-  deploy_green:
-    if: github.ref_name == 'restructure/monorepo' && needs.pick_target.outputs.target_color == 'green'
-    needs: [resolve_image, pick_target]
-    runs-on: [self-hosted, green]
-    environment: Production
-    steps:
-      - name: Show runner info
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Runner: $(hostname) / $(uname -a)"
-          docker --version || true
-          which docker || true
-          which curl || (sudo apt-get update -y && sudo apt-get install -y curl)
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull image
-        shell: bash
-        env:
-          IMAGE: ${{ needs.resolve_image.outputs.IMAGE_PULL }}
-        run: |
-          set -euo pipefail
-          docker pull "$IMAGE"
-
-      - name: Free host port ${{ env.PROD_PORT }} if used
-        shell: bash
-        run: |
-          set -euo pipefail
-          CIDS=$(docker ps -q --filter "publish=${{ env.PROD_PORT }}")
-          if [ -n "$CIDS" ]; then
-            echo "Port ${{ env.PROD_PORT }} is in use by container(s): $CIDS — stopping…"
-            docker rm -f $CIDS || true
-          fi
-          if ss -ltnp | grep -q ":${{ env.PROD_PORT }} "; then
-            echo "❌ Port ${{ env.PROD_PORT }} still busy (non-Docker process):"
-            ss -ltnp | grep ":${{ env.PROD_PORT }} " || true
-            exit 1
-          fi
-
-      - name: Remove old prod containers (optional cleanup)
-        shell: bash
-        run: |
-          set -euo pipefail
-          OLD=$(docker ps -a --filter "name=^prodContainer_" -q)
-          if [ -n "$OLD" ]; then
-            echo "Removing old prod containers: $OLD"
-            docker rm -f $OLD || true
-          fi
-
-      - name: Run new container (host ${{ env.PROD_PORT }} -> container 3000)
-        shell: bash
-        env:
-          IMAGE:   ${{ needs.resolve_image.outputs.IMAGE_PULL }}
-          BASE:    ${{ needs.resolve_image.outputs.BASE_TAG }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_PORT: ${{ secrets.DB_PORT }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASS: ${{ secrets.DB_PASSWORD }}
-          DB_NAME: ${{ secrets.DB_NAME }}
-        run: |
-          set -euo pipefail
-          NAME="prodContainer_${BASE}"
-          docker run -d --name "$NAME" \
-            --label app=prod-backend \
-            -e DB_HOST="$DB_HOST" \
-            -e DB_PORT="$DB_PORT" \
-            -e DB_USER="$DB_USER" \
-            -e DB_PASSWORD="$DB_PASS" \
-            -e DB_NAME="$DB_NAME" \
-            -e PORT="3000" \
-            -p ${PROD_PORT}:3000 \
-            "$IMAGE"
-          echo "Started: $NAME"
           docker ps --filter "name=$NAME"
 
       - name: Local health check on target VM (pre-flip)
@@ -331,11 +210,7 @@ jobs:
           exit 1
 
   flip_proxy_and_soak:
-    # proceed only if either deploy job succeeded
-    if: >
-      github.ref_name == 'restructure/monorepo' &&
-      (needs.deploy_blue.result == 'success' || needs.deploy_green.result == 'success')
-    needs: [resolve_image, pick_target, deploy_blue, deploy_green]
+    needs: [resolve_image, pick_target, deploy_to_target]
     runs-on: [self-hosted, proxy]
     environment: Production
     steps:
@@ -344,25 +219,15 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ needs.pick_target.outputs.target_color }}
-          ACTIVE: ${{ needs.pick_target.outputs.active_color }}
         run: |
           set -euo pipefail
-          ACTIVE_LINK="${{ env.ACTIVE_LINK }}"
-          BLUE_CONF="${{ env.BLUE_CONF }}"
-          GREEN_CONF="${{ env.GREEN_CONF }}"
-
-          PREV=$(readlink -f "$ACTIVE_LINK" || true)
-          echo "Previous active symlink target: $PREV"
-
-          if [[ "$TARGET" == "blue" ]]; then NEW="$BLUE_CONF"; else NEW="$GREEN_CONF"; fi
-
+          PREV=$(readlink -f "${{ env.ACTIVE_LINK }}" || true)
+          if [[ "$TARGET" == "blue" ]]; then NEW="${{ env.BLUE_CONF }}"; else NEW="${{ env.GREEN_CONF }}"; fi
           echo "Switching active to: $TARGET  ($NEW)"
-          sudo ln -sfn "$NEW" "$ACTIVE_LINK"
+          sudo ln -sfn "$NEW" "${{ env.ACTIVE_LINK }}"
           sudo nginx -t
           sudo systemctl reload nginx
-
           echo "prev_target=$PREV" >> "$GITHUB_OUTPUT"
-          echo "new_target=$NEW"  >> "$GITHUB_OUTPUT"
 
       - name: Immediate proxy health check
         shell: bash
@@ -370,7 +235,7 @@ jobs:
           set -euo pipefail
           for i in {1..60}; do
             if curl -fsS "http://127.0.0.1/api/health" >/dev/null 2>&1; then
-              echo "✅ Proxy -> backend health OK after flip."
+              echo "✅ Proxy → backend health OK after flip."
               exit 0
             fi
             sleep 2
@@ -378,7 +243,7 @@ jobs:
           echo "❌ Proxy health failed right after flip."
           exit 1
 
-      - name: Soak and re-check via proxy (auto-rollback on failure)
+      - name: Soak and re-check via proxy
         shell: bash
         env:
           SOAK: ${{ inputs.SOAK_SECONDS }}
@@ -388,7 +253,7 @@ jobs:
           echo "Soaking for $REM seconds with health sampling…"
           while [ "$REM" -gt 0 ]; do
             if ! curl -fsS "http://127.0.0.1/api/health" >/dev/null 2>&1; then
-              echo "❌ Health failed during soak. Rolling back…"
+              echo "❌ Health failed during soak. Triggering rollback…"
               exit 42
             fi
             sleep 15
@@ -396,7 +261,7 @@ jobs:
           done
           echo "✅ Soak complete; health OK."
 
-      - name: Rollback (if soak failed)
+      - name: Roll back proxy symlink (if soak failed)
         if: failure()
         shell: bash
         env:
