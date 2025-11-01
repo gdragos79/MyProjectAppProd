@@ -106,6 +106,26 @@ sudo systemd-creds encrypt --with-key=host --name=app.env \
 
 # Erase plaintext
 shred -u /tmp/app.env
+# On the Staging VM:
+sudo install -d -m 700 /etc/credstore.encrypted
+tmpfile=$(mktemp /tmp/app_staging.XXXXXX.env)
+umask 077
+
+cat > "$tmpfile" <<'ENV'
+TAG=latest
+DB_HOST=192.168.238.137
+DB_PORT=5432
+DB_USER=deploy
+DB_PASSWORD=password1234
+DB_NAME=myappstagingdb
+VITE_API_BASE_URL=/api
+ENV
+
+# For your systemd-creds version: encrypt <OUTPUT> <INPUT>
+sudo systemd-creds encrypt /etc/credstore.encrypted/app-staging.env "$tmpfile"
+
+# Securely wipe the temporary plaintext (on prod and staging machines)
+shred -u "$tmpfile"
 ```
 
 ### 4) Verify you can decrypt it locally
@@ -299,3 +319,4 @@ journalctl -xeu myproject-app -n 50 --no-pager
 ```
 
 and I’ll pinpoint the exact tweak.
+
