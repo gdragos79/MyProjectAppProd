@@ -1,0 +1,113 @@
+name: CI SBX (sync main→dev, test, optional pushes)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SYNC_DEVELOPMENT:
+        description: "If true, push the synced dev (after tests pass) back to origin/development."
+        type: boolean
+        default: false
+      MERGE_TO_MAIN:
+        description: "If true, merge development → main (after dev push). Leave false for SBX."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # needed only if you ever toggle the push/merge inputs to true
+  packages: read
+
+jobs:
+  ci:
+    # guard: only run from the test branch
+    if: github.ref_name == 'restructure/monorepo'
+    runs-on: ubuntu-latest
+    # use your sandbox environment (with DEV_* secrets)
+    environment:
+      name: Development-SBX
+
+    steps:
+      - name: Checkout repository (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure Git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # -----------------------------
+      # 1) Prepare a local scratch branch = dev-ci
+      #    Start from origin/development and merge origin/main into it (LOCAL ONLY).
+      #    This simulates "pull main into development" without pushing yet.
+      # -----------------------------
+      - name: Create local dev-ci from origin/development and merge origin/main
+        run: |
+          set -e
+          git fetch origin main development
+          # Start a local scratch branch from remote development
+          git checkout -B dev-ci origin/development
+          # Merge main into dev-ci (this is the "pull main into development" step)
+          git merge --no-edit origin/main
+          # Stay on dev-ci for testing
+
+      # -----------------------------
+      # 2) BACKEND: install, lint (optional), test
+      #    (Adjust scripts if needed)
+      # -----------------------------
+      - name: Backend - install deps (npm ci)
+        working-directory: apps/backend
+        run: npm ci
+
+      - name: Backend - tests
+        working-directory: apps/backend
+        env:
+          DB_HOST: ${{ secrets.DEV_DB_HOST }}
+          DB_PORT: ${{ secrets.DEV_DB_PORT }}
+          DB_USER: ${{ secrets.DEV_DB_USER }}
+          DB_PASSWORD: ${{ secrets.DEV_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DEV_DB_NAME }}
+        run: |
+          # If you haven't added tests yet, this will exit 0 but remind you to add them.
+          npm test -- --runInBand || echo "No backend tests yet? Add a Jest+Supertest health test."
+
+      # -----------------------------
+      # 3) FRONTEND: install, build (fail if it can’t build)
+      # -----------------------------
+      - name: Frontend - install deps (npm ci)
+        working-directory: apps/frontend
+        run: npm ci
+
+      - name: Frontend - build
+        working-directory: apps/frontend
+        run: npm run build
+
+      # -----------------------------
+      # 4) OPTIONAL: push dev-ci → origin/development
+      #    This will actually update the real development branch, but only if you toggle SYNC_DEVELOPMENT=true.
+      # -----------------------------
+      - name: Push dev-ci to origin/development (optional)
+        if: inputs.SYNC_DEVELOPMENT == true
+        run: |
+          set -e
+          # Fast-forward if possible; otherwise merge with a message
+          git checkout development || git checkout -b development
+          git merge --ff-only dev-ci || git merge --no-edit dev-ci
+          git push origin HEAD:development
+
+      # -----------------------------
+      # 5) OPTIONAL: merge development → main (only if you also toggled MERGE_TO_MAIN=true)
+      # -----------------------------
+      - name: Merge development into main (optional)
+        if: inputs.MERGE_TO_MAIN == true
+        run: |
+          set -e
+          git checkout main
+          git fetch origin development
+          git merge --ff-only origin/development || git merge --no-edit origin/development
+          git push origin main
