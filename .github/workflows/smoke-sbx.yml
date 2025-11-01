@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   # --------------------------
-  # Job A: uses DB from SECRETS
+  # Job A: uses DB from SECRETS (external DB)
   # --------------------------
   smoke_secrets:
     if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB == true
@@ -85,28 +85,13 @@ jobs:
           exit 1
 
   # -----------------------------------
-  # Job B: EPHEMERAL Postgres (but creds from SECRETS)
+  # Job B: EPHEMERAL Postgres (using secrets for creds)
   # -----------------------------------
   smoke_ephemeral:
     if: github.ref_name == 'restructure/monorepo' && inputs.USE_SECRETS_DB != true
     name: Smoke (Ephemeral DB via Secrets)
     runs-on: ubuntu-latest
     environment: Development-SBX
-
-    # Start a temporary Postgres that uses the SAME credentials you store in secrets
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: ${{ secrets.SMOKE_DB_USER }}
-          POSTGRES_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
-          POSTGRES_DB: ${{ secrets.SMOKE_DB_NAME }}
-        ports: ['5432:5432']
-        options: >-
-          --health-cmd="pg_isready -U ${{ secrets.SMOKE_DB_USER }} -d ${{ secrets.SMOKE_DB_NAME }}"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=30
 
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +108,29 @@ jobs:
             echo "Missing required secrets: ${missing[*]}" >&2
             exit 1
           fi
+
+      - name: Start ephemeral Postgres (docker) with secrets
+        env:
+          EP_DB_USER:     ${{ secrets.SMOKE_DB_USER }}
+          EP_DB_PASSWORD: ${{ secrets.SMOKE_DB_PASSWORD }}
+          EP_DB_NAME:     ${{ secrets.SMOKE_DB_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm -f sbx_pg 2>/dev/null || true
+          docker run -d --name sbx_pg -p 5432:5432 \
+            -e POSTGRES_USER="$EP_DB_USER" \
+            -e POSTGRES_PASSWORD="$EP_DB_PASSWORD" \
+            -e POSTGRES_DB="$EP_DB_NAME" \
+            postgres:15
+          # wait for readiness
+          for i in {1..60}; do
+            if docker exec sbx_pg pg_isready -U "$EP_DB_USER" -d "$EP_DB_NAME" >/dev/null 2>&1; then
+              echo "Ephemeral Postgres is ready."
+              break
+            fi
+            sleep 2
+          done
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
@@ -149,7 +157,6 @@ jobs:
       - name: Start backend and wait for /api/health (Ephemeral DB via Secrets)
         working-directory: apps/backend
         env:
-          # Point to the ephemeral DB exposed to the job on localhost:5432
           DB_HOST: 127.0.0.1
           DB_PORT: 5432
           DB_USER: ${{ secrets.SMOKE_DB_USER }}
@@ -169,4 +176,6 @@ jobs:
           done
           echo "❌ Health check failed. Last 200 lines of backend log:"
           tail -n 200 /tmp/backend.log || true
+          # show DB logs too (helps debugging)
+          docker logs --tail=200 sbx_pg || true
           exit 1
