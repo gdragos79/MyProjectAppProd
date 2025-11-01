@@ -1,23 +1,22 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "private": true,
-  "type": "commonjs",
+  "description": "Express + Postgres backend",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "test": "NODE_ENV=test jest --passWithNoTests"
+    "start": "nodemon index.js",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest --passWithNoTests"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "nodemon": "^3.1.0",
+    "pg": "^8.11.0",
+    "body-parser": "^1.20.2"
   },
   "devDependencies": {
     "jest": "^29.7.0",
-    "supertest": "^7.1.1",
-    "nodemon": "^3.1.7"
+    "supertest": "^7.1.1"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "type": "module"
 }
